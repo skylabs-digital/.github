@@ -10,6 +10,12 @@ on:
         description: 'Only gitleaks'
         type: boolean
         default: false
+      osv-scan-args:
+        description: 'OSV args'
+        type: string
+        default: |-
+          --recursive
+          ./
 jobs:
   hello:
     runs-on: ubuntu-latest
