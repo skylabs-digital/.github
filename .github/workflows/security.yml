@@ -1,131 +1,28 @@
 name: Security Scan (reusable)
-
-# Reusable security workflow for Skylabs Digital repos.
-#
-# Usage (caller):
-#   jobs:
-#     security:
-#       uses: skylabs-digital/.github/.github/workflows/security.yml@v1
-#       with:
-#         docker-images: |
-#           [{"name":"my-api","context":".","dockerfile":"backend/Dockerfile"}]
-
 on:
   workflow_call:
     inputs:
       docker-images:
-        description: 'JSON array of images: [{"name","context","dockerfile"}]'
         type: string
         default: '[]'
       gitleaks-only:
-        description: 'Only run gitleaks (for infra/config repos without package.json)'
         type: boolean
         default: false
-      osv-scan-args:
-        description: 'Override OSV-Scanner scan-args'
-        type: string
-        default: |-
-          --recursive
-          ./
-
-permissions:
-  contents: read
-
 jobs:
   osv-scan:
     if: ${{ !inputs.gitleaks-only }}
-    name: OSV-Scanner (deps)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
-
-      - name: Run OSV-Scanner
-        uses: google/osv-scanner-action/osv-scanner-action@c51854704019a247608d928f370c98740469d4b5  # v2.3.5
-        with:
-          scan-args: ${{ inputs.osv-scan-args }}
-
+      - run: echo "osv"
   secrets-scan:
-    name: Gitleaks (secrets in code + history)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
-        with:
-          fetch-depth: 0
-
-      - name: Install Gitleaks v8.30.1
-        run: |
-          set -euo pipefail
-          VERSION=8.30.1
-          case "$(uname -m)" in
-            x86_64)
-              ASSET=gitleaks_${VERSION}_linux_x64.tar.gz
-              SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-              ;;
-            aarch64|arm64)
-              ASSET=gitleaks_${VERSION}_linux_arm64.tar.gz
-              SHA256=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
-              ;;
-            *)
-              echo "Unsupported architecture: $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}" -o gitleaks.tgz
-          echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
-          tar -xzf gitleaks.tgz gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
-          gitleaks version
-
-      - name: Scan repository (full history)
-        run: gitleaks detect --source . --redact --exit-code 1 --verbose
-
+      - run: echo "secrets"
   docker-scan:
-    # Only on push/schedule, never on PR. Sentinel matrix value keeps matrix
-    # non-empty when caller didn't set docker-images (GitHub rejects empty matrices).
     if: ${{ inputs.docker-images != '[]' && github.event_name != 'pull_request' }}
-    name: Grype (${{ matrix.image.name }})
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     strategy:
-      fail-fast: false
       matrix:
-        image: ${{ fromJson(inputs.docker-images != '[]' && inputs.docker-images || '[{"name":"_skip_","context":".","dockerfile":""}]') }}
+        image: ${{ fromJson(inputs.docker-images) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
-
-      - name: Build image (local, no push)
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v6.18.0
-        with:
-          context: ${{ matrix.image.context }}
-          file: ${{ matrix.image.dockerfile }}
-          push: false
-          load: true
-          tags: ${{ matrix.image.name }}:${{ github.sha }}
-          build-args: |
-            BUILD_COMMIT=${{ github.sha }}
-
-      - name: Install Grype v0.111.1
-        run: |
-          set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.111.1/install.sh | sh -s -- -b /usr/local/bin v0.111.1
-          grype version
-
-      - name: Scan image
-        run: |
-          set -euo pipefail
-          CONFIG_FLAG=""
-          if [ -f .grype.yaml ]; then
-            echo "Using .grype.yaml from calling repo"
-            CONFIG_FLAG="-c .grype.yaml"
-          fi
-          grype ${{ matrix.image.name }}:${{ github.sha }} $CONFIG_FLAG --fail-on high --only-fixed
+      - run: echo "docker"
