@@ -3,15 +3,11 @@ on:
   workflow_call:
     inputs:
       docker-images:
-        description: 'JSON array of images'
+        description: 'JSON array'
         type: string
         default: '[]'
-      gitleaks-only:
-        description: 'Only gitleaks'
-        type: boolean
-        default: false
 jobs:
   hello:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "with inputs: docker=${{ inputs.docker-images }} gitleaks=${{ inputs.gitleaks-only }}"
+      - run: echo "hello"
