@@ -23,6 +23,10 @@ on:
         default: |-
           --recursive
           ./
+    secrets:
+      npm-token:
+        description: 'GHCR token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
+        required: false
 
 jobs:
   osv-scan:
@@ -101,6 +105,8 @@ jobs:
           tags: ${{ matrix.image.name }}:${{ github.sha }}
           build-args: |
             BUILD_COMMIT=${{ github.sha }}
+          secrets: |
+            npm_token=${{ secrets.npm-token }}
 
       - name: Install Grype v0.111.1
         run: |
