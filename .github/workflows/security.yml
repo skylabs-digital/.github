@@ -1,20 +1,5 @@
 name: Security Scan (reusable)
 
-# Reusable security workflow for Skylabs Digital repos.
-#
-# Usage (caller):
-#   jobs:
-#     security:
-#       uses: skylabs-digital/.github/.github/workflows/security.yml@v1
-#       with:
-#         docker-images: |
-#           [{"name":"my-api","context":".","dockerfile":"backend/Dockerfile"}]
-#
-# Jobs:
-#   - osv-scan     : deps vulnerability scan (skipped if gitleaks-only=true)
-#   - secrets-scan : gitleaks full-history secret scan (always runs)
-#   - docker-scan  : grype container scan (only on push/schedule; never on PRs)
-
 on:
   workflow_call:
     inputs:
@@ -27,7 +12,7 @@ on:
         type: boolean
         default: false
       osv-scan-args:
-        description: 'Override OSV-Scanner scan-args (default: --recursive ./)'
+        description: 'Override OSV-Scanner scan-args'
         type: string
         default: |-
           --recursive
@@ -63,8 +48,6 @@ jobs:
           fetch-depth: 0
 
       - name: Install Gitleaks v8.30.1
-        # Arch-aware so this also works under `act` on Apple Silicon hosts where
-        # the runner image is native arm64. github.com hosted runners are amd64.
         run: |
           set -euo pipefail
           VERSION=8.30.1
@@ -92,9 +75,8 @@ jobs:
         run: gitleaks detect --source . --redact --exit-code 1 --verbose
 
   docker-scan:
-    # Only run on main pushes and schedule — NEVER on pull_request events.
-    # PRs are covered by osv-scan (which catches dep vulnerabilities before merge).
-    # Rationale: container scans take 5-10 min per image × N images; PR overhead is not worth it.
+    # Only run when caller provided images AND not on PRs
+    # Uses a sentinel array to keep matrix non-empty when skipping (GitHub rejects empty matrices at parse time)
     if: ${{ inputs.docker-images != '[]' && github.event_name != 'pull_request' }}
     name: Grype (${{ matrix.image.name }})
     runs-on: ubuntu-latest
@@ -103,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(inputs.docker-images) }}
+        image: ${{ fromJson(inputs.docker-images != '[]' && inputs.docker-images || '[{"name":"_skip_","context":".","dockerfile":""}]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
@@ -129,8 +111,6 @@ jobs:
           grype version
 
       - name: Scan ${{ matrix.image.name }}
-        # Loads .grype.yaml (ignore list for known-safe advisories) if it exists
-        # in the calling repo. Callers opt in by committing this file.
         run: |
           set -euo pipefail
           CONFIG_FLAG=""
