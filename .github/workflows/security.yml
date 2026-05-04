@@ -25,7 +25,13 @@ on:
           ./
     secrets:
       npm-token:
-        description: 'GHCR token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
+        description: '[DEPRECATED — prefer app-id + private-key] Static token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
+        required: false
+      app-id:
+        description: 'GitHub App ID (e.g. semantic-release-bot-skylabs). If provided together with private-key, the workflow generates an ephemeral installation token and uses it as npm_token for Docker builds. Takes precedence over npm-token.'
+        required: false
+      private-key:
+        description: 'GitHub App private key matching app-id.'
         required: false
 
 jobs:
@@ -89,6 +95,40 @@ jobs:
       matrix:
         image: ${{ fromJson(inputs.docker-images) }}
     steps:
+      # When app-id + private-key are provided, generate an ephemeral
+      # installation token and prefer it over the legacy npm-token secret.
+      # This avoids shipping a long-lived PAT across repos.
+      - name: Generate GitHub App Token (if configured)
+        id: app-token
+        if: ${{ secrets.app-id != '' && secrets.private-key != '' }}
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Resolve npm_token for Docker build
+        id: npm
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          NPM_TOKEN: ${{ secrets.npm-token }}
+        run: |
+          # Prefer app-generated token (short-lived, scoped). Fall back to
+          # the legacy static `npm-token` for backward compatibility with
+          # callers that haven't migrated yet.
+          if [ -n "${APP_TOKEN}" ]; then
+            echo "source=app-token (ephemeral installation token)"
+            echo "::add-mask::${APP_TOKEN}"
+            echo "token=${APP_TOKEN}" >> $GITHUB_OUTPUT
+          elif [ -n "${NPM_TOKEN}" ]; then
+            echo "source=npm-token (legacy)"
+            echo "::add-mask::${NPM_TOKEN}"
+            echo "token=${NPM_TOKEN}" >> $GITHUB_OUTPUT
+          else
+            echo "source=none"
+            echo "token=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
 
@@ -106,7 +146,7 @@ jobs:
           build-args: |
             BUILD_COMMIT=${{ github.sha }}
           secrets: |
-            npm_token=${{ secrets.npm-token }}
+            npm_token=${{ steps.npm.outputs.token }}
 
       - name: Install Grype v0.111.1
         run: |
