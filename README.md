@@ -135,3 +135,133 @@ jobs:
 
 - Pin to `@v1` for stability
 - Breaking changes → `@v2`
+
+---
+
+# Dependabot template
+
+`dependabot.yml` cannot be inherited from this org `.github` repo (GitHub limitation: only issue/PR templates and a few other files inherit). The canonical templates below are the source of truth; apply them with `scripts/sync-dependabot.sh` (one-shot, see below).
+
+## Behaviour summary
+
+- **Routine version updates** (weekly): only `patch` and `minor` for npm and docker. No major bumps.
+- **Security updates**: GitHub Dependabot opens separate PRs labeled `security` when a CVE matches your lockfile. These bypass the `dependabot.yml` `ignore` rules and propose the minimum patched version (which can be a major if no patch/minor fix exists). Requires `vulnerability-alerts` and `automated-security-fixes` enabled at the repo level.
+
+## Template T1 — Node + Docker monorepo
+
+For repos with one or more Dockerfiles and yarn workspaces (e.g. `resuelto`, `noten`, `idachu`, `kommi`, `skylabs-mcp`).
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # One docker block per Dockerfile dir. Major bumps blocked here; security
+  # advisories from GitHub still bypass these rules and may bump majors.
+  - package-ecosystem: docker
+    directory: /backend
+    schedule: { interval: weekly }
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      docker:
+        patterns: ["*"]
+
+  # ... repeat the docker block for each Dockerfile dir (frontend/, backoffice/, etc.)
+
+  # One npm block per workspace dir. update-types restricted to patch+minor.
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      dev-deps:
+        dependency-type: development
+        update-types: [patch, minor]
+      prod-deps:
+        dependency-type: production
+        update-types: [patch, minor]
+
+  # ... repeat the npm block for each workspace (backend/, frontend/, backoffice/)
+```
+
+## Template T2 — Single-package Node lib / FE
+
+For libs and single-package apps (e.g. `analytics`, `react-identity-access`, `react-proto-kit`, `menu-engine`, `appoint-mvp`, `appoint`, `plato`, `cashier`, `fisto`, `wedding-app-fe`).
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      dev-deps:
+        dependency-type: development
+        update-types: [patch, minor]
+      prod-deps:
+        dependency-type: production
+        update-types: [patch, minor]
+```
+
+## Template T3 — Infra / config (no node, no docker build)
+
+For `infra` and similar.
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ["*"]
+```
+
+## Applying the template
+
+```bash
+# In the .github repo
+./scripts/sync-dependabot.sh /path/to/repo
+
+# Or to dry-run
+./scripts/sync-dependabot.sh --dry-run /path/to/repo
+```
+
+The script auto-detects:
+- Dockerfile dirs (any dir containing `Dockerfile*`) → adds a docker block
+- npm workspace dirs (any dir with `package.json` not in `node_modules`) → adds an npm block
+
+If the repo has neither, it falls back to T3 (github-actions only).
+
+## Enabling security updates
+
+After applying, enable at the repo level:
+
+```bash
+gh api -X PUT /repos/skylabs-digital/<repo>/vulnerability-alerts
+gh api -X PUT /repos/skylabs-digital/<repo>/automated-security-fixes
+```
+
+Verify:
+
+```bash
+gh api /repos/skylabs-digital/<repo>/automated-security-fixes
+# → {"enabled": true, "paused": false}
+```
+
