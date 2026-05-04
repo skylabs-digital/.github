@@ -265,3 +265,107 @@ gh api /repos/skylabs-digital/<repo>/automated-security-fixes
 # → {"enabled": true, "paused": false}
 ```
 
+
+---
+
+# Unified Release Pipeline (`release.yml`)
+
+All Skylabs repos use a **single unified workflow** instead of the legacy
+`version.yml` + `security.yml` + `ci-*.yml` + `deploy-*.yml` quartet. One
+file per repo, 5 stages, job dependencies gating each stage.
+
+## Why unified
+
+| Problem with legacy split | Unified fix |
+|---|---|
+| Double **Auto Version** runs (version workflow re-triggered on its own `chore(release)` commit) | `[skip ci]` on bot commit — workflow doesn't re-fire |
+| Double **Docker builds** (Grype built its own image while CI built another) | Single build in Stage 3, GHCR-hosted image reused by Grype + deploy |
+| Tag push didn't trigger downstream workflows (default `GITHUB_TOKEN` can't fan out events) | GitHub App Token (`semantic-release-bot-skylabs`) for git push |
+| `workflow_dispatch` / `workflow_call` plumbing across 4 files | In-workflow `needs:` — one file, one DAG |
+| Private npm auth (`@skylabs-digital/*`) broken in Grype builds | BuildKit `--mount=type=secret,id=npm_token` in Dockerfile, `.yarnrc.yml` reads `NODE_AUTH_TOKEN` |
+
+## 5-Stage Structure
+
+```
+PR + push                 push:main only
+   │                            │
+   ▼                            ▼
+┌──────────────┐  OK    ┌─────────────┐  OK  ┌─────────────┐  OK  ┌─────────────┐  OK  ┌────────────┐
+│ 1. STATIC    │───────▶│ 2. VERSION  │─────▶│ 3. BUILD    │─────▶│ 4. IMAGE    │─────▶│ 5. DEPLOY  │
+│ CHECKS       │        │ BUMP & TAG  │      │ IMAGES      │      │ SCAN        │      │ QA + SMOKE │
+│              │        │             │      │             │      │             │      │ + ROLLBACK │
+│ ci-<svc> × N │        │ conv. cmts  │      │ parallel    │      │ Grype pulls │      │ ssh,       │
+│ osv-scan     │        │ → semver    │      │ per service │      │ from GHCR   │      │ migrate,   │
+│ gitleaks     │        │ App Token   │      │ 1 image /   │      │ .grype.yaml │      │ worker     │
+│ parallel     │        │ for git push│      │ service     │      │ fail-on     │      │ restart,   │
+│              │        │ [skip ci]   │      │ push + tag  │      │ high, only- │      │ tag qa-    │
+│              │        │ commit      │      │ vN + sha +  │      │ fixed       │      │ stable     │
+│              │        │             │      │ latest      │      │             │      │            │
+└──────────────┘        └─────────────┘      └─────────────┘      └─────────────┘      └────────────┘
+```
+
+Any stage failure halts its branch of the DAG for that service. Deploys only run when the service's `build + grype + version.bumped` all succeed.
+
+## Variants by project type
+
+| Variant | Repos | Jobs | Build stage | Deploy stage |
+|---|---|---|---|---|
+| **Multi-service app** | `noten`, `resuelto`, `idachu`, `kommi` | 11–15 | `build-api`, `build-bo`, `build-web` (as needed) | `deploy-api` (+ worker restart), `deploy-bo`, `deploy-web` |
+| **Single-service app** | `skylabs-mcp` | 7 | `build` | `deploy` (Monitor droplet) |
+| **Library (npm publish)** | `react-proto-kit`, `react-identity-access`, `menu-engine` | 4–5 | semantic-release handles version + npm publish in one step | (no deploy — `publish-gpr` mirrors to GitHub Packages) |
+
+See live examples:
+- [noten `release.yml`](https://github.com/skylabs-digital/noten/blob/main/.github/workflows/release.yml) — canonical multi-service (api + bo)
+- [resuelto `release.yml`](https://github.com/skylabs-digital/resuelto/blob/main/.github/workflows/release.yml) — 4-service (api + worker + bo + web)
+- [skylabs-mcp `release.yml`](https://github.com/skylabs-digital/skylabs-mcp/blob/main/.github/workflows/release.yml) — single-service on Monitor
+- [react-proto-kit `release.yml`](https://github.com/skylabs-digital/react-proto-kit/blob/main/.github/workflows/release.yml) — lib w/ semantic-release
+
+## Required org-level secrets / vars
+
+| Name | Type | Scope | Used for |
+|---|---|---|---|
+| `SEMANTIC_RELEASE_APP_ID` | secret | org | GitHub App id (`semantic-release-bot-skylabs`), used to mint installation tokens |
+| `SEMANTIC_RELEASE_PRIVATE_KEY` | secret | org | App private key matching the ID |
+| `GHCR_TOKEN` | secret | org | Classic PAT with `read:packages` + `write:packages` — used for npm auth (App tokens cannot read GH Packages npm) and Docker login on Droplets |
+| `DEPLOY_SSH_KEY` | secret | org | SSH key for `deploy` user on QA / Prod / Monitor droplets |
+| `QA_PRIVATE_IP` | var | org | `10.10.10.2` |
+| `PROD_PRIVATE_IP` | var | org | `10.10.10.4` |
+| `MONITOR_PRIVATE_IP` | var | org | `10.10.10.8` |
+| `BASTION_HOST` | var | org | `45.55.75.102` |
+| `BASTION_SSH_PORT` | var | org | `41222` |
+
+## Private npm packages (`@skylabs-digital/*`) in Docker builds
+
+GitHub App installation tokens authenticate OK against `npm.pkg.github.com`
+but return **403 Forbidden** when fetching tarballs — a known GH limitation
+(`packages:read` permission on the installation does not translate into npm
+registry reads). So we use the classic PAT stored as `GHCR_TOKEN`:
+
+```dockerfile
+# In the Dockerfile:
+RUN --mount=type=secret,id=npm_token \
+    NODE_AUTH_TOKEN=$(cat /run/secrets/npm_token) \
+    yarn install --immutable
+```
+
+```yaml
+# .yarnrc.yml
+npmRegistries:
+  "https://npm.pkg.github.com":
+    npmAlwaysAuth: true
+    npmAuthToken: "${NODE_AUTH_TOKEN-}"
+npmScopes:
+  skylabs-digital:
+    npmRegistryServer: "https://npm.pkg.github.com"
+```
+
+```yaml
+# In release.yml build job:
+- uses: docker/build-push-action@...
+  with:
+    secrets: |
+      npm_token=${{ secrets.GHCR_TOKEN }}
+```
+
+Repos without private `@skylabs-digital` deps (e.g. `idachu`, `kommi`,
+`skylabs-mcp`) skip the BuildKit secret plumbing entirely.
