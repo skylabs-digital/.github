@@ -95,12 +95,28 @@ jobs:
       matrix:
         image: ${{ fromJson(inputs.docker-images) }}
     steps:
+      # Reusable workflows can't reference `secrets.*` directly inside a
+      # step-level `if:` — it causes a startup failure. So we first dump
+      # the secret presence into a step output, then gate subsequent
+      # steps on that output.
+      - name: Detect App Token availability
+        id: has-app
+        env:
+          APP_ID: ${{ secrets.app-id }}
+          PRIVATE_KEY: ${{ secrets.private-key }}
+        run: |
+          if [ -n "${APP_ID}" ] && [ -n "${PRIVATE_KEY}" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+          fi
+
       # When app-id + private-key are provided, generate an ephemeral
       # installation token and prefer it over the legacy npm-token secret.
       # This avoids shipping a long-lived PAT across repos.
       - name: Generate GitHub App Token (if configured)
         id: app-token
-        if: ${{ secrets.app-id != '' && secrets.private-key != '' }}
+        if: steps.has-app.outputs.available == 'true'
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
         with:
           app-id: ${{ secrets.app-id }}
