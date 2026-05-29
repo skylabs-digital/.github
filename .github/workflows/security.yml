@@ -38,7 +38,7 @@ jobs:
   osv-scan:
     if: ${{ !inputs.gitleaks-only }}
     name: OSV-Scanner (deps)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, skylabs]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
@@ -50,7 +50,7 @@ jobs:
 
   secrets-scan:
     name: Gitleaks (secrets in code + history)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, skylabs]
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
@@ -89,7 +89,7 @@ jobs:
     # PRs are covered by osv-scan on package lockfiles; container builds are expensive (~5-10 min/image).
     if: ${{ inputs.docker-images != '[]' && github.event_name != 'pull_request' }}
     name: Grype (${{ matrix.image.name }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, skylabs]
     strategy:
       fail-fast: false
       matrix:
