@@ -146,9 +146,14 @@ jobs:
       # kind/healthPath/hasMigrations keys, so we forward it verbatim.
       docker-images: ${{ inputs.services }}
     secrets:
+      # Grype builds each image to scan it, which runs `yarn workspaces focus`
+      # and pulls the private @skylabs-digital/* packages from GHCR npm. Use the
+      # GHCR_TOKEN PAT (read:packages) for that. Do NOT forward app-id/private-key:
+      # security.yml@v1 prefers an ephemeral GitHub App installation token over
+      # npm-token, but that App token lacks read:packages → 403 Forbidden on the
+      # private-package install (whole Grype matrix fails). The App token is only
+      # needed by the version stage (commit/tag push), which mints its own.
       npm-token: ${{ secrets.GHCR_TOKEN }}
-      app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
-      private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
 
   # ============================================================
   # STAGE 2 — VERSION BUMP  (THE FORK POINT)
