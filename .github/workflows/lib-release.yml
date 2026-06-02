@@ -142,15 +142,22 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      - name: Stryker (incremental)
-        # Prefer the repo's `mutation` script; fall back to a direct
-        # incremental Stryker run so libs without the script still get coverage.
+      - name: Stryker (mutation)
+        # Run the repo's canonical mutation script. The standard lib script is
+        # `test:mutation`; some repos also alias `mutation`. Prefer test:mutation,
+        # fall back to mutation. If neither exists, skip with a warning — do NOT
+        # `yarn dlx stryker run`: bare `stryker` resolves to the ancient,
+        # abandoned stryker@0.35.x package (modern one is @stryker-mutator/core),
+        # which crashes with "Cannot find module 'stryker-api/config'" and fails
+        # the whole job. Incremental mode is the repo's stryker.conf concern.
         run: |
           set -e
-          if yarn run --help >/dev/null 2>&1 && node -e "const s=require('./package.json').scripts||{};process.exit(s.mutation?0:1)"; then
-            yarn mutation --incremental
+          if node -e "const s=require('./package.json').scripts||{};process.exit(s['test:mutation']?0:1)"; then
+            yarn test:mutation
+          elif node -e "const s=require('./package.json').scripts||{};process.exit(s.mutation?0:1)"; then
+            yarn mutation
           else
-            yarn dlx stryker run --incremental
+            echo "::warning::No test:mutation or mutation script found — skipping mutation testing"
           fi
 
   # ============================================================
