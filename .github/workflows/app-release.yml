@@ -1,0 +1,418 @@
+name: App Release (reusable)
+
+# ============================================================================
+# Reusable unified release pipeline for Skylabs Digital APPS (app-multi /
+# app-single). One file, 5 stages, FULL-on-main / REDUCED-on-PR fork encoded
+# ENTIRELY inside this reusable — callers only declare `on:` triggers and pass
+# their service topology.
+#
+#   STAGE 1  static-checks   (every event: PR + push:main + schedule)
+#   STAGE 1  security        (org reusable security.yml@v1 — every event)
+#   STAGE 2  version         (push:main only — conventional-commit bumper)
+#   STAGE 3  build-images    (needs version, bumped==true)
+#   STAGE 4  image-scan       FOLDED INTO security.yml@v1 (Grype, push/sched only)
+#   STAGE 5  deploy           (needs version + build, bumped==true)
+#
+# The fork point is the `version` job: `if: push && ref==main && !chore(release)`.
+# On a PR, `version` never runs, so every build-*/deploy-* job (each
+# `needs: [version]` + `if: needs.version.outputs.bumped == 'true'`) is
+# structurally unreachable. PRs therefore get exactly static-checks + security
+# (REDUCED); main push gets the whole chain (FULL).
+#
+# All third-party actions are SHA-pinned here so every consumer inherits the
+# supply-chain hardening for free.
+#
+# ----------------------------------------------------------------------------
+# HOW A CONSUMING REPO CALLS THIS (minimal caller `.github/workflows/release.yml`):
+#
+#   name: Release
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
+#     schedule:
+#       - cron: '0 6 * * 1'
+#   permissions:
+#     contents: write
+#     packages: write
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: skylabs-digital/.github/.github/workflows/app-release.yml@main
+#       with:
+#         variant: app-multi
+#         deploy-env: qa
+#         smoke-base-url: https://qa.myapp.ar
+#         services: |
+#           [
+#             {"name":"myapp-api","kind":"backend","dockerfile":"backend/Dockerfile","context":".","healthPath":"/api/health","hasMigrations":true},
+#             {"name":"myapp-bo","kind":"static","dockerfile":"backoffice/Dockerfile","context":".","healthPath":"/bo/"},
+#             {"name":"myapp-web","kind":"static","dockerfile":"frontend/Dockerfile","context":".","healthPath":"/"}
+#           ]
+#       secrets: inherit
+#
+# `services` is the SINGLE SOURCE OF TRUTH: it drives static-checks, build,
+# deploy AND the security reusable's docker-images list. `secrets: inherit`
+# passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY, DEPLOY_SSH_KEY and
+# the org-level vars through automatically.
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        description: 'app-multi | app-single (informational; topology is driven by `services`)'
+        type: string
+        default: app-multi
+      node-version:
+        description: 'Node version for static checks'
+        type: string
+        default: '24'
+      services:
+        description: >-
+          JSON array of service objects. Each:
+          {name, kind(backend|static|worker), dockerfile, context?(default "."),
+           healthPath?, hasMigrations?(bool)}. Single source of truth for
+          static-checks + build + deploy + security docker-images.
+        type: string
+        required: true
+      deploy-env:
+        description: 'Deploy environment (maps to QA_PRIVATE_IP etc.)'
+        type: string
+        default: qa
+      smoke-base-url:
+        description: 'Base URL for post-deploy smoke tests (e.g. https://qa.myapp.ar)'
+        type: string
+        default: ''
+      runner-labels:
+        description: 'JSON array of runner labels'
+        type: string
+        default: '["self-hosted","linux","x64","skylabs"]'
+    secrets:
+      GHCR_TOKEN:
+        description: 'Classic PAT (read:packages + write:packages) for private npm + GHCR/Droplet docker login'
+        required: false
+      SEMANTIC_RELEASE_APP_ID:
+        description: 'GitHub App id for semantic-release-bot-skylabs (mints git-push token)'
+        required: false
+      SEMANTIC_RELEASE_PRIVATE_KEY:
+        description: 'GitHub App private key matching SEMANTIC_RELEASE_APP_ID'
+        required: false
+      DEPLOY_SSH_KEY:
+        description: 'SSH key for the deploy user on QA/Prod droplets'
+        required: false
+
+jobs:
+  # ============================================================
+  # STAGE 1 — STATIC CHECKS
+  # One matrix entry per service. `yarn ci` is the canonical per-workspace
+  # gate (typecheck + lint + test + build). Runs on every event.
+  # ============================================================
+  static-checks:
+    if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule'
+    name: Static checks (${{ matrix.service.name }})
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(inputs.services) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: CI (typecheck + lint + test + build)
+        run: yarn ci
+
+  # ============================================================
+  # STAGE 1 — SECURITY (org reusable@v1) — also hosts STAGE 4 image-scan.
+  # docker-images is derived from `services` (single source). OSV + Gitleaks
+  # run on every event; Grype (image-scan) runs push/schedule only — gated
+  # inside the reusable.
+  # ============================================================
+  security:
+    name: Security (org reusable@v1)
+    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    with:
+      # `services` doubles as the Grype docker-images list. security.yml@v1
+      # reads only {name, context, dockerfile} per entry and ignores the extra
+      # kind/healthPath/hasMigrations keys, so we forward it verbatim.
+      docker-images: ${{ inputs.services }}
+    secrets:
+      npm-token: ${{ secrets.GHCR_TOKEN }}
+      app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+      private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+
+  # ============================================================
+  # STAGE 2 — VERSION BUMP  (THE FORK POINT)
+  # Bespoke conventional-commit shell bumper (semantic-release is libs-only).
+  # Only runs on push:main and never on its own release commit, so the whole
+  # build+deploy tail is unreachable on PR/non-main/schedule (= REDUCED run).
+  # ============================================================
+  version:
+    name: Bump version & tag
+    needs: [static-checks, security]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      !contains(github.event.head_commit.message, 'chore(release):')
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      bumped: ${{ steps.bump.outputs.bumped }}
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "semantic-release-bot-skylabs[bot]"
+          git config user.email "semantic-release-bot-skylabs[bot]@users.noreply.github.com"
+
+      - name: Bump version + tag + push
+        id: bump
+        run: |
+          set -euo pipefail
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          COMMITS=$([ -z "$LAST_TAG" ] && git log --oneline || git log "${LAST_TAG}..HEAD" --oneline)
+
+          if echo "$COMMITS" | grep -qiE "^[a-f0-9]+ (BREAKING CHANGE|feat!|fix!|refactor!):"; then
+            BUMP=major
+          elif echo "$COMMITS" | grep -qiE "^[a-f0-9]+ feat(\(.*\))?:"; then
+            BUMP=minor
+          elif echo "$COMMITS" | grep -qiE "^[a-f0-9]+ (fix|perf|refactor)(\(.*\))?:"; then
+            BUMP=patch
+          else
+            echo "No releasable commits — skipping bump"
+            echo "bumped=false" >> $GITHUB_OUTPUT
+            echo "version=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CURRENT=$(node -p "require('./package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Tag-collision guard: keep bumping patch until a free slot is found.
+          git fetch --tags --force --quiet origin || true
+          while git rev-parse -q --verify "refs/tags/v${NEW}" >/dev/null 2>&1 \
+             || git ls-remote --exit-code --tags origin "refs/tags/v${NEW}" >/dev/null 2>&1; do
+            echo "Tag v${NEW} already exists — bumping patch"
+            PATCH=$((PATCH + 1))
+            NEW="${MAJOR}.${MINOR}.${PATCH}"
+          done
+
+          echo "Bumping: ${CURRENT} → ${NEW} (${BUMP})"
+
+          # Bump every package.json found (root + workspaces), shallow scan.
+          for pj in package.json */package.json; do
+            [ -f "$pj" ] || continue
+            node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('$pj','utf8'));if(p.version){p.version='$NEW';fs.writeFileSync('$pj',JSON.stringify(p,null,2)+'\n');}"
+          done
+
+          DATE=$(date +%Y-%m-%d)
+          if [ -z "$LAST_TAG" ]; then
+            RANGE_COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
+          else
+            RANGE_COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline --pretty=format:"- %s (%h)")
+          fi
+          ENTRY="## [${NEW}] - ${DATE}\n\n${RANGE_COMMITS}\n"
+          if [ -f CHANGELOG.md ]; then
+            echo -e "# Changelog\n\n${ENTRY}\n$(tail -n +2 CHANGELOG.md)" > CHANGELOG.md
+          else
+            echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
+          fi
+
+          git add -A
+          git commit -m "chore(release): v${NEW} [skip ci]"
+          git tag -a "v${NEW}" -m "Release v${NEW}"
+          git push origin HEAD:main --follow-tags
+
+          echo "bumped=true" >> $GITHUB_OUTPUT
+          echo "version=${NEW}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.bumped == 'true'
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v2.4.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: v${{ steps.bump.outputs.version }}
+          body_path: CHANGELOG.md
+          generate_release_notes: true
+
+  # ============================================================
+  # STAGE 3 — BUILD IMAGES
+  # One matrix entry per service. Pushes vN + sha + latest to GHCR.
+  # Unreachable on PR (needs version, which never runs there).
+  # ============================================================
+  build-images:
+    name: Build image (${{ matrix.service.name }})
+    needs: [version]
+    if: needs.version.outputs.bumped == 'true'
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(inputs.services) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: v${{ needs.version.outputs.version }}
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v6.18.0
+        with:
+          context: ${{ matrix.service.context || '.' }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:v${{ needs.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:latest
+          build-args: |
+            BUILD_COMMIT=${{ github.sha }}
+            APP_VERSION=v${{ needs.version.outputs.version }}
+          secrets: |
+            npm_token=${{ secrets.GHCR_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+          provenance: false
+          sbom: false
+
+  # ============================================================
+  # STAGE 5 — DEPLOY
+  # One matrix entry per service. Backend services with hasMigrations run a
+  # `db:migrate:plan` dry-run, then apply via the isolated `migrator` compose
+  # service, before deploy. Smoke test + qa-stable tag + rollback on failure.
+  # Unreachable on PR. Prod is a separate, manually-approved path (not here).
+  # ============================================================
+  deploy:
+    name: Deploy (${{ matrix.service.name }})
+    needs: [version, build-images]
+    if: needs.version.outputs.bumped == 'true'
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    environment: ${{ inputs.deploy-env }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        service: ${{ fromJson(inputs.services) }}
+    env:
+      REGISTRY: ghcr.io
+      SERVICE_NAME: ${{ matrix.service.name }}
+      IMAGE_NAME: ${{ github.repository_owner }}/${{ matrix.service.name }}
+      TAG: v${{ needs.version.outputs.version }}
+      DEPLOY_ENV: ${{ inputs.deploy-env }}
+    steps:
+      - name: Plan migrations (dry-run) + apply (isolated migrator)
+        # db-migrate-cicd.md rule #1: ALWAYS db:migrate:plan dry-run before
+        # apply. Runs only for backend services that declare hasMigrations.
+        if: ${{ matrix.service.hasMigrations }}
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ vars.QA_PRIVATE_IP }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          proxy_host: ${{ vars.BASTION_HOST }}
+          proxy_port: ${{ vars.BASTION_SSH_PORT }}
+          proxy_username: deploy
+          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: REGISTRY,IMAGE_NAME,TAG,DEPLOY_ENV,SERVICE_NAME
+          script: |
+            set -e
+            cd /opt/skylabs
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+            docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
+            COMPOSE="docker compose -f compose.yml -f compose.${DEPLOY_ENV}.yml"
+            MIGRATOR="${SERVICE_NAME%-*}-migrator"
+            echo "== Dry-run migration plan =="
+            ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:plan
+            echo "== Applying migrations =="
+            ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:deploy
+
+      - name: Deploy service
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ vars.QA_PRIVATE_IP }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          proxy_host: ${{ vars.BASTION_HOST }}
+          proxy_port: ${{ vars.BASTION_SSH_PORT }}
+          proxy_username: deploy
+          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: REGISTRY,IMAGE_NAME,SERVICE_NAME,TAG,DEPLOY_ENV
+          script: |
+            set -e
+            cd /opt/skylabs
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+            docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
+            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
+
+      - name: Smoke test
+        if: ${{ inputs.smoke-base-url != '' && matrix.service.healthPath }}
+        run: |
+          sleep 12
+          URL="${{ inputs.smoke-base-url }}${{ matrix.service.healthPath }}"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
+          echo "Smoke: $URL -> HTTP ${STATUS}"
+          [ "$STATUS" = "200" ] || { echo "::error::Smoke test failed (HTTP ${STATUS})"; exit 1; }
+
+      - name: Log in to GHCR
+        if: success()
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag as ${{ inputs.deploy-env }}-stable
+        if: success()
+        run: |
+          set -e
+          docker pull ghcr.io/${IMAGE_NAME}:${TAG}
+          docker tag ghcr.io/${IMAGE_NAME}:${TAG} ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
+          docker push ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
+
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ vars.QA_PRIVATE_IP }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          proxy_host: ${{ vars.BASTION_HOST }}
+          proxy_port: ${{ vars.BASTION_SSH_PORT }}
+          proxy_username: deploy
+          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: SERVICE_NAME,DEPLOY_ENV
+          script: |
+            set -e
+            cd /opt/skylabs
+            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --rollback
