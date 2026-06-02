@@ -361,7 +361,11 @@ jobs:
             cd /opt/skylabs
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
             docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
-            COMPOSE="docker compose -f compose.yml -f compose.${DEPLOY_ENV}.yml"
+            # --env-file is REQUIRED for ${<APP>_DATABASE_URL} interpolation in
+            # the compose `environment:` blocks — without it the migrator gets an
+            # empty DATABASE_URL and fails with "no such database: postgres".
+            # deploy-service.sh injects env the same way (scripts/deploy-service.sh).
+            COMPOSE="docker compose --env-file /opt/skylabs/.env -f compose.yml -f compose.${DEPLOY_ENV}.yml"
             APP="${SERVICE_NAME%-*}"
             MIGRATOR="${APP}-migrator"
             # The migrator service image is pinned to ${<APP>_API_TAG:-latest}.
