@@ -362,9 +362,15 @@ jobs:
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
             docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
             COMPOSE="docker compose -f compose.yml -f compose.${DEPLOY_ENV}.yml"
-            MIGRATOR="${SERVICE_NAME%-*}-migrator"
-            echo "== Applying migrations =="
-            ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:deploy
+            APP="${SERVICE_NAME%-*}"
+            MIGRATOR="${APP}-migrator"
+            # The migrator service image is pinned to ${<APP>_API_TAG:-latest}.
+            # Export the freshly-built tag so the migrator runs the NEW image
+            # (which contains db:migrate:deploy) instead of a stale :latest —
+            # otherwise: `Command "db:migrate:deploy" not found`.
+            TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
+            echo "== Applying migrations (${MIGRATOR} @ ${TAG}) =="
+            env "${TAG_VAR}=${TAG}" ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:deploy
 
       - name: Deploy service
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
