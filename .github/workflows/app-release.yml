@@ -336,9 +336,15 @@ jobs:
       TAG: v${{ needs.version.outputs.version }}
       DEPLOY_ENV: ${{ inputs.deploy-env }}
     steps:
-      - name: Plan migrations (dry-run) + apply (isolated migrator)
-        # db-migrate-cicd.md rule #1: ALWAYS db:migrate:plan dry-run before
-        # apply. Runs only for backend services that declare hasMigrations.
+      - name: Apply migrations (isolated migrator)
+        # Apply committed migrations via the isolated one-shot <app>-migrator
+        # compose service, using the COMPILED migrator in the prod image
+        # (db:migrate:deploy = node dist/...). We do NOT run db:migrate:plan
+        # here: that script is tsx/drizzle-kit based and the prod runtime image
+        # excludes those by design (CVE remediation), so it is absent in the
+        # deployed container (`Command "db:migrate:plan" not found`). The
+        # migration consistency check belongs at build time (static-checks),
+        # not against the prod image. Runs only for services with hasMigrations.
         if: ${{ matrix.service.hasMigrations }}
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
@@ -357,8 +363,6 @@ jobs:
             docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
             COMPOSE="docker compose -f compose.yml -f compose.${DEPLOY_ENV}.yml"
             MIGRATOR="${SERVICE_NAME%-*}-migrator"
-            echo "== Dry-run migration plan =="
-            ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:plan
             echo "== Applying migrations =="
             ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:deploy
 
