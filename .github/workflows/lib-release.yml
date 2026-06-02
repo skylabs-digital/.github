@@ -1,0 +1,210 @@
+name: Lib Release (reusable)
+
+# ============================================================================
+# Reusable unified release pipeline for Skylabs Digital LIBRARIES (npm publish).
+# One file, FULL-on-main / REDUCED-on-PR fork encoded ENTIRELY inside here —
+# callers only declare `on:` triggers.
+#
+#   STAGE 1  ci         static-checks: typecheck + lint + test (coverage floor)
+#                       + Stryker incremental mutation (parallel required check)
+#   STAGE 1  security   org reusable security.yml@v1 (OSV + Gitleaks; no images)
+#   STAGE 2  release    semantic-release (version + npm publish) — push:main only
+#
+# The fork point is the `release` job: `if: push && ref==main`. On a PR it
+# never runs, so PRs get exactly ci + security (REDUCED); main push also
+# publishes (FULL).
+#
+# `run-mutation: true` (default) wires Stryker incremental as a REQUIRED
+# parallel check — closing the ecosystem-wide "Stryker configured locally but
+# absent from CI" gap without each lib hand-rolling a stryker-pr.yml.
+#
+# All third-party actions are SHA-pinned here so every consumer inherits the
+# supply-chain hardening for free.
+#
+# ----------------------------------------------------------------------------
+# HOW A CONSUMING REPO CALLS THIS (minimal caller `.github/workflows/release.yml`):
+#
+#   name: Release
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
+#     schedule:
+#       - cron: '0 6 * * 1'
+#   permissions:
+#     contents: write
+#     packages: write
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: skylabs-digital/.github/.github/workflows/lib-release.yml@main
+#       with:
+#         node-version: '24'
+#         build-tool: tsup        # tsc | tsup | vite
+#         run-mutation: true      # Stryker incremental as a required check
+#         coverage-floor: 90
+#       secrets: inherit
+#
+# `secrets: inherit` passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY.
+# The lib must define `yarn typecheck`, `yarn lint`, `yarn test`, `yarn build`,
+# `yarn mutation` (or `stryker run`), and a `release.config.*` for
+# semantic-release. coverage-floor is enforced via the lib's own vitest config
+# (`coverageThreshold`); this input is forwarded as STRYKER/COVERAGE_FLOOR for
+# repos that read it.
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node version'
+        type: string
+        default: '24'
+      build-tool:
+        description: 'Build tool the lib uses (tsc | tsup | vite). Informational; `yarn build` is invoked.'
+        type: string
+        default: tsc
+      run-mutation:
+        description: 'Run Stryker incremental mutation testing as a required parallel check'
+        type: boolean
+        default: true
+      coverage-floor:
+        description: 'Coverage floor percent (forwarded as COVERAGE_FLOOR; enforced by the lib vitest config)'
+        type: number
+        default: 90
+    secrets:
+      GHCR_TOKEN:
+        description: 'Classic PAT (read:packages + write:packages) for private npm deps + GitHub Packages publish'
+        required: false
+      SEMANTIC_RELEASE_APP_ID:
+        description: 'GitHub App id for semantic-release-bot-skylabs'
+        required: false
+      SEMANTIC_RELEASE_PRIVATE_KEY:
+        description: 'GitHub App private key matching SEMANTIC_RELEASE_APP_ID'
+        required: false
+
+jobs:
+  # ============================================================
+  # STAGE 1 — CI (static checks + coverage)
+  # ============================================================
+  ci:
+    if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule'
+    name: CI (typecheck + lint + test)
+    runs-on: [self-hosted, linux, x64, skylabs]
+    env:
+      COVERAGE_FLOOR: ${{ inputs.coverage-floor }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@skylabs-digital'
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: Typecheck
+        run: yarn typecheck
+      - name: Lint
+        run: yarn lint
+      - name: Test (coverage)
+        run: yarn test --coverage
+      - name: Build
+        run: yarn build
+
+  # ============================================================
+  # STAGE 1 — MUTATION (Stryker incremental) — REQUIRED PARALLEL CHECK
+  # Closes the ecosystem-wide "Stryker local-only" gap. Runs on every event
+  # (PR + push:main) when run-mutation is true.
+  # ============================================================
+  mutation:
+    if: ${{ inputs.run-mutation && github.actor != 'dependabot[bot]' && github.event_name != 'schedule' }}
+    name: Mutation (Stryker incremental)
+    runs-on: [self-hosted, linux, x64, skylabs]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@skylabs-digital'
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: Stryker (incremental)
+        # Prefer the repo's `mutation` script; fall back to a direct
+        # incremental Stryker run so libs without the script still get coverage.
+        run: |
+          set -e
+          if yarn run --help >/dev/null 2>&1 && node -e "const s=require('./package.json').scripts||{};process.exit(s.mutation?0:1)"; then
+            yarn mutation --incremental
+          else
+            yarn dlx stryker run --incremental
+          fi
+
+  # ============================================================
+  # STAGE 1 — SECURITY (org reusable@v1). No docker-images for libs, so Grype
+  # is skipped; OSV + Gitleaks run on every event.
+  # ============================================================
+  security:
+    name: Security (org reusable@v1)
+    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    secrets:
+      npm-token: ${{ secrets.GHCR_TOKEN }}
+
+  # ============================================================
+  # STAGE 2 — SEMANTIC RELEASE (version + npm publish) — push:main only.
+  # THE FORK POINT: never runs on PR/non-main/schedule (= REDUCED run).
+  # ============================================================
+  release:
+    name: Semantic release
+    needs: [ci, mutation, security]
+    # `mutation` may be skipped (run-mutation:false); !failure() lets release
+    # proceed when its only-skipped dependency didn't run, while still blocking
+    # on a real ci/security/mutation failure.
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, skylabs]
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@skylabs-digital'
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: Build
+        run: yarn build
+      - name: Semantic release
+        run: yarn dlx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

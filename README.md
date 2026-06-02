@@ -13,6 +13,128 @@ Standardized security scanning: dependency vulnerabilities (OSV), secrets in git
 - No `permissions:` block in the reusable — permissions inherit from the caller, avoiding cross-repo escalation and startup failures.
 - `osv-scan` and `secrets-scan` are fast (<30 s combined); safe to run on every matching PR.
 
+### `app-release.yml` — App release pipeline (app-multi / app-single)
+
+The full 5-stage unified release pipeline for **apps**, extracted to an org
+reusable. The FULL-on-`main` / REDUCED-on-PR fork lives **inside** the
+reusable — callers only declare `on:` triggers and pass their service
+topology. See [Unified Release Pipeline](#unified-release-pipeline-releaseyml)
+below for the stage model.
+
+- **REDUCED** (PR / non-main): `static-checks` + `security` only. The `version`
+  job is `if: push && ref==main && !chore(release)`, so every `build`/`deploy`
+  job (`needs: [version]` + `if: bumped == 'true'`) is structurally unreachable
+  on PRs.
+- **FULL** (push to `main`): static-checks → security → version → build-images
+  → image-scan (folded into `security`) → deploy QA + smoke + `qa-stable` tag,
+  rollback on failure.
+- `services` is the **single source of truth**: it drives the static-checks
+  matrix, the build matrix, the deploy matrix, *and* the `security` reusable's
+  `docker-images` list.
+- Backend services with `"hasMigrations": true` run a `db:migrate:plan`
+  dry-run before applying via the isolated `migrator` compose service
+  (db-migrate-cicd.md rule #1).
+- All third-party actions are SHA-pinned in the reusable; consumers inherit the
+  hardening for free.
+
+**Minimal caller** (`.github/workflows/release.yml`):
+
+```yaml
+name: Release
+on:
+  pull_request: { branches: [main] }
+  push: { branches: [main] }
+  schedule: [{ cron: '0 6 * * 1' }]
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+jobs:
+  release:
+    uses: skylabs-digital/.github/.github/workflows/app-release.yml@main
+    with:
+      variant: app-multi          # app-multi | app-single (informational)
+      deploy-env: qa
+      smoke-base-url: https://qa.myapp.ar
+      services: |
+        [
+          {"name":"myapp-api","kind":"backend","dockerfile":"backend/Dockerfile","context":".","healthPath":"/api/health","hasMigrations":true},
+          {"name":"myapp-bo","kind":"static","dockerfile":"backoffice/Dockerfile","context":".","healthPath":"/bo/"},
+          {"name":"myapp-web","kind":"static","dockerfile":"frontend/Dockerfile","context":".","healthPath":"/"}
+        ]
+    secrets: inherit
+```
+
+For an **app-single** repo, pass `variant: app-single` and a one-element
+`services` array.
+
+#### `app-release.yml` inputs
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `variant` | string | `app-multi` | `app-multi` \| `app-single` (informational; topology comes from `services`) |
+| `node-version` | string | `24` | Node version for static checks |
+| `services` | string (JSON) | **required** | Array of `{name, kind, dockerfile, context?, healthPath?, hasMigrations?}` — single source of truth |
+| `deploy-env` | string | `qa` | Deploy environment (maps to `QA_PRIVATE_IP` etc.) |
+| `smoke-base-url` | string | `''` | Base URL for post-deploy smoke tests |
+| `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Runner labels |
+
+Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
+`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`).
+
+### `lib-release.yml` — Library release pipeline
+
+The unified release pipeline for **npm libraries**: `ci → security →
+semantic-release`, fork-encoded inside the reusable.
+
+- **REDUCED** (PR / non-main): `ci` (typecheck + lint + test/coverage + build)
+  + `mutation` (Stryker incremental) + `security`. The `release` job is
+  `if: push && ref==main`, so PRs never publish.
+- **FULL** (push to `main`): the above plus `semantic-release` (version + npm
+  publish to GitHub Packages).
+- `run-mutation: true` (default) wires **Stryker incremental as a required
+  parallel check** — closing the ecosystem-wide "Stryker configured locally
+  but absent from CI" gap without each lib hand-rolling a `stryker-pr.yml`.
+
+**Minimal caller** (`.github/workflows/release.yml`):
+
+```yaml
+name: Release
+on:
+  pull_request: { branches: [main] }
+  push: { branches: [main] }
+  schedule: [{ cron: '0 6 * * 1' }]
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+jobs:
+  release:
+    uses: skylabs-digital/.github/.github/workflows/lib-release.yml@main
+    with:
+      node-version: '24'
+      build-tool: tsup        # tsc | tsup | vite
+      run-mutation: true
+      coverage-floor: 90
+    secrets: inherit
+```
+
+The lib must define `yarn typecheck`, `yarn lint`, `yarn test`, `yarn build`,
+a `mutation` script (or have Stryker installed for `stryker run`), and a
+`release.config.*` for semantic-release.
+
+#### `lib-release.yml` inputs
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `node-version` | string | `24` | Node version |
+| `build-tool` | string | `tsc` | `tsc` \| `tsup` \| `vite` (informational; `yarn build` is invoked) |
+| `run-mutation` | boolean | `true` | Run Stryker incremental as a required parallel check |
+| `coverage-floor` | number | `90` | Coverage floor (forwarded as `COVERAGE_FLOOR`; enforced by the lib vitest config) |
+
+Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
+`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`).
+
 ---
 
 ## Caller templates
