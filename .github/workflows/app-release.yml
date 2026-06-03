@@ -400,12 +400,23 @@ jobs:
             /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
 
       - name: Smoke test
-        if: ${{ inputs.smoke-base-url != '' && matrix.service.healthPath }}
+        # Per-service smoke URL for multi-host apps: a service served on a
+        # different host than smoke-base-url (e.g. a backoffice/web on its own
+        # domain vs the api host) sets its own `smokeUrl`. Fall back to
+        # `smoke-base-url + healthPath`; skip when neither is resolvable rather
+        # than curling the wrong host (which 404s and fails the deploy).
         run: |
+          SMOKE_URL="${{ matrix.service.smokeUrl }}"
+          if [ -z "$SMOKE_URL" ] && [ -n "${{ inputs.smoke-base-url }}" ] && [ -n "${{ matrix.service.healthPath }}" ]; then
+            SMOKE_URL="${{ inputs.smoke-base-url }}${{ matrix.service.healthPath }}"
+          fi
+          if [ -z "$SMOKE_URL" ]; then
+            echo "No smoke URL for ${{ matrix.service.name }} — skipping smoke test"
+            exit 0
+          fi
           sleep 12
-          URL="${{ inputs.smoke-base-url }}${{ matrix.service.healthPath }}"
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
-          echo "Smoke: $URL -> HTTP ${STATUS}"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$SMOKE_URL")
+          echo "Smoke: $SMOKE_URL -> HTTP ${STATUS}"
           [ "$STATUS" = "200" ] || { echo "::error::Smoke test failed (HTTP ${STATUS})"; exit 1; }
 
       - name: Log in to GHCR
