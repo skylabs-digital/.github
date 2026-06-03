@@ -374,7 +374,12 @@ jobs:
             # otherwise: `Command "db:migrate:deploy" not found`.
             TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
             echo "== Applying migrations (${MIGRATOR} @ ${TAG}) =="
-            env "${TAG_VAR}=${TAG}" ${COMPOSE} run --rm "${MIGRATOR}" yarn db:migrate:deploy
+            # Run the migrator service's OWN command (a compiled `node dist/...`
+            # entrypoint declared in compose). Do NOT force `yarn db:migrate:deploy`:
+            # node-only runtime images (no corepack) can't run yarn, and the base
+            # image's stale yarn collides with packageManager. node-direct is
+            # yarn-independent and matches the node-only-runtime CVE-isolation rule.
+            env "${TAG_VAR}=${TAG}" ${COMPOSE} run --rm "${MIGRATOR}"
 
       - name: Deploy service
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
