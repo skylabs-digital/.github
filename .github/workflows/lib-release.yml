@@ -119,9 +119,12 @@ jobs:
         run: yarn build
 
   # ============================================================
-  # STAGE 1 — MUTATION (Stryker incremental) — REQUIRED PARALLEL CHECK
+  # STAGE 1 — MUTATION (Stryker incremental) — INFORMATIVE PARALLEL CHECK
   # Closes the ecosystem-wide "Stryker local-only" gap. Runs on every event
-  # (PR + push:main) when run-mutation is true.
+  # (PR + push:main) when run-mutation is true. NON-BLOCKING: a mutation-score
+  # regression is surfaced as a ::warning:: + job summary but the job always
+  # succeeds, so it never blocks a merge or the release. Mutation testing is a
+  # signal to act on, not a gate, for a small team.
   # ============================================================
   mutation:
     if: ${{ inputs.run-mutation && github.actor != 'dependabot[bot]' && github.event_name != 'schedule' }}
@@ -142,7 +145,7 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      - name: Stryker (mutation)
+      - name: Stryker (mutation) — informative, non-blocking
         # Run the repo's canonical mutation script. The standard lib script is
         # `test:mutation`; some repos also alias `mutation`. Prefer test:mutation,
         # fall back to mutation. If neither exists, skip with a warning — do NOT
@@ -150,15 +153,28 @@ jobs:
         # abandoned stryker@0.35.x package (modern one is @stryker-mutator/core),
         # which crashes with "Cannot find module 'stryker-api/config'" and fails
         # the whole job. Incremental mode is the repo's stryker.conf concern.
+        #
+        # NON-BLOCKING: we capture Stryker's exit code and always exit 0. A
+        # threshold regression becomes a ::warning:: + job summary, not a failure.
         run: |
-          set -e
+          set -uo pipefail   # NOT -e: we handle the exit code ourselves
           if node -e "const s=require('./package.json').scripts||{};process.exit(s['test:mutation']?0:1)"; then
-            yarn test:mutation
+            yarn test:mutation; rc=$?
           elif node -e "const s=require('./package.json').scripts||{};process.exit(s.mutation?0:1)"; then
-            yarn mutation
+            yarn mutation; rc=$?
           else
             echo "::warning::No test:mutation or mutation script found — skipping mutation testing"
+            rc=0
           fi
+          if [ "${rc}" -ne 0 ]; then
+            echo "::warning title=Mutation score below threshold::Stryker exited ${rc}. Informative only — not blocking the merge/release. Review the report above and raise coverage where it matters."
+            { echo "## ⚠️ Mutation (Stryker) — below threshold (informative)";
+              echo "";
+              echo "Stryker exited \`${rc}\`. This check is **non-blocking**; review the mutants above and add tests where the gap is meaningful."; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ✅ Mutation (Stryker) — passed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
 
   # ============================================================
   # STAGE 1 — SECURITY (org reusable@v1). No docker-images for libs, so Grype
@@ -177,9 +193,9 @@ jobs:
   release:
     name: Semantic release
     needs: [ci, mutation, security]
-    # `mutation` may be skipped (run-mutation:false); !failure() lets release
-    # proceed when its only-skipped dependency didn't run, while still blocking
-    # on a real ci/security/mutation failure.
+    # `mutation` is informative (always succeeds) and may be skipped
+    # (run-mutation:false); !failure() lets release proceed in both cases while
+    # still blocking on a real ci/security failure.
     if: |
       !failure() && !cancelled() &&
       github.event_name == 'push' &&
