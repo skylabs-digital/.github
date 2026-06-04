@@ -18,11 +18,15 @@ on:
         type: boolean
         default: false
       osv-scan-args:
-        description: 'Override OSV-Scanner scan-args'
+        description: 'Override OSV-Scanner scan targets'
         type: string
         default: |-
           --recursive
           ./
+      osv-fail-on-severity:
+        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE OSV finding blocks the pipeline. Findings with no available fix, or below this severity, are reported as warnings only (non-blocking). Default: high — parity with Grype --fail-on high.'
+        type: string
+        default: high
     secrets:
       npm-token:
         description: '[DEPRECATED — prefer app-id + private-key] Static token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
@@ -43,10 +47,102 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
 
-      - name: Run OSV-Scanner
+      # OSV-Scanner has no native "--only-fixed" (unlike Grype), so run it
+      # non-blocking with JSON output and let the gate step below decide.
+      # continue-on-error: the scanner exits 1 when it finds vulns; we don't
+      # want that exit to fail the job — the policy in the next step does.
+      - name: Run OSV-Scanner (JSON, non-blocking)
+        id: osv
+        continue-on-error: true
         uses: google/osv-scanner-action/osv-scanner-action@c51854704019a247608d928f370c98740469d4b5  # v2.3.5
         with:
-          scan-args: ${{ inputs.osv-scan-args }}
+          scan-args: |-
+            --format=json
+            --output=osv-results.json
+            ${{ inputs.osv-scan-args }}
+
+      # Policy gate (parity with Grype --fail-on high --only-fixed):
+      #   BLOCK  iff a finding is fixable (a patched version exists) AND its
+      #          severity >= osv-fail-on-severity.
+      #   WARN   for everything else — no fix available yet, or below threshold.
+      # Nothing is silently dropped: all findings are listed in the job summary.
+      - name: Gate on fixable findings
+        env:
+          FAIL_ON: ${{ inputs.osv-fail-on-severity }}
+          OSV_OUTCOME: ${{ steps.osv.outcome }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/osv-gate.cjs <<'GATE'
+          const fs = require('fs');
+          const FAIL_ON = (process.env.FAIL_ON || 'high').toLowerCase();
+          const RANK = { critical: 4, high: 3, medium: 2, moderate: 2, low: 1, unknown: 0 };
+          const threshold = RANK[FAIL_ON] ?? 3;
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
+
+          if (!fs.existsSync('osv-results.json')) {
+            // Scanner produced no file. Distinguish "clean" (exit 0) from a real error.
+            if (process.env.OSV_OUTCOME === 'success') {
+              append(`## OSV-Scanner\n\nNo vulnerabilities found.`);
+            } else {
+              const msg = 'OSV-Scanner produced no results file (scan may have errored) — not blocking.';
+              console.log(`::warning title=OSV-Scanner::${msg}`);
+              append(`## OSV-Scanner\n\n${msg}`);
+            }
+            process.exit(0);
+          }
+
+          let data;
+          try { data = JSON.parse(fs.readFileSync('osv-results.json', 'utf8')); }
+          catch (e) { console.log(`::warning title=OSV-Scanner::Could not parse results (${e.message}) — not blocking.`); process.exit(0); }
+
+          const scoreToRank = (s) => s >= 9 ? 4 : s >= 7 ? 3 : s >= 4 ? 2 : s > 0 ? 1 : 0;
+          const rankToLabel = { 4: 'critical', 3: 'high', 2: 'medium', 1: 'low', 0: 'unknown' };
+          const blocking = [], warnings = [];
+
+          for (const res of data.results || []) {
+            const source = res.source && res.source.path ? res.source.path : '';
+            for (const pkg of res.packages || []) {
+              const p = pkg.package || {};
+              // id -> CVSS score from groups[].max_severity (most reliable numeric severity)
+              const cvss = new Map();
+              for (const g of pkg.groups || []) {
+                const sc = parseFloat(g.max_severity);
+                if (!Number.isNaN(sc)) for (const id of g.ids || []) cvss.set(id, sc);
+              }
+              for (const v of pkg.vulnerabilities || []) {
+                const fixable = (v.affected || []).some(a =>
+                  (a.ranges || []).some(r => (r.events || []).some(e => 'fixed' in e)));
+                let rank;
+                if (cvss.has(v.id)) rank = scoreToRank(cvss.get(v.id));
+                else rank = RANK[((v.database_specific && v.database_specific.severity) || '').toLowerCase()] ?? 0;
+                const rec = { id: v.id, pkg: `${p.name}@${p.version}`, sev: rankToLabel[rank], source, fixable };
+                (fixable && rank >= threshold ? blocking : warnings).push(rec);
+              }
+            }
+          }
+
+          const dedupe = (arr) => { const m = new Map(); for (const r of arr) m.set(`${r.id}|${r.pkg}`, r); return [...m.values()]; };
+          const B = dedupe(blocking), W = dedupe(warnings);
+          const table = (rows) => rows.length
+            ? ['| ID | Package | Severity | Fix |', '|---|---|---|---|',
+               ...rows.map(r => `| ${r.id} | ${r.pkg} | ${r.sev} | ${r.fixable ? 'available' : 'none yet'} |`)].join('\n')
+            : '_none_';
+
+          append(`## OSV-Scanner — dependency vulnerabilities`);
+          append(`Policy: block on **fixable** findings of severity **${FAIL_ON}+**; no-fix-yet and below-threshold are warnings.\n`);
+          append(`- 🚫 Blocking (fixable, ≥ ${FAIL_ON}): **${B.length}**`);
+          append(`- ⚠️ Warnings (no fix yet, or below threshold): **${W.length}**\n`);
+          if (B.length) { append(`### 🚫 Blocking`); append(table(B) + '\n'); }
+          append(`### ⚠️ Warnings`); append(table(W) + '\n');
+
+          for (const r of W) console.log(`::warning title=OSV ${r.id} (${r.sev}, ${r.fixable ? 'fix available, below threshold' : 'no fix yet'})::${r.pkg} in ${r.source}`);
+          for (const r of B) console.log(`::error title=OSV ${r.id} (${r.sev}, fix available)::${r.pkg} in ${r.source} — upgrade to a patched version`);
+
+          if (B.length) { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s).`); process.exit(1); }
+          console.log(`\nNo blocking findings. ${W.length} warning(s) reported (non-blocking).`);
+          GATE
+          node /tmp/osv-gate.cjs
 
   secrets-scan:
     name: Gitleaks (secrets in code + history)

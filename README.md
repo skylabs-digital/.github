@@ -12,6 +12,7 @@ Standardized security scanning: dependency vulnerabilities (OSV), secrets in git
 - `docker-scan` runs **only** on `push:main` and the weekly `schedule` — never on PRs. PR coverage comes from `osv-scan` over lockfiles.
 - No `permissions:` block in the reusable — permissions inherit from the caller, avoiding cross-repo escalation and startup failures.
 - `osv-scan` and `secrets-scan` are fast (<30 s combined); safe to run on every matching PR.
+- **`osv-scan` is fixability-gated** (parity with Grype `--fail-on high --only-fixed`): it runs non-blocking with JSON output, then **fails only on FIXABLE findings ≥ `osv-fail-on-severity`** (default `high`). Vulns with no upstream patch yet, or below the threshold, are reported as `::warning::` + a job summary, never blocking the pipeline. See `docs/standards/cicd-security-reusable.md`.
 
 ### `app-release.yml` — App release pipeline (app-multi / app-single)
 
@@ -239,7 +240,8 @@ jobs:
 |---|---|---|---|
 | `docker-images` | string (JSON) | `'[]'` | Array of `{name, context, dockerfile}` for Grype scan |
 | `gitleaks-only` | boolean | `false` | Skip OSV-Scanner (non-Node repos) |
-| `osv-scan-args` | string | `--recursive ./` | Override OSV-Scanner args |
+| `osv-scan-args` | string | `--recursive ./` | Override OSV-Scanner scan targets |
+| `osv-fail-on-severity` | string | `high` | Min severity (`critical\|high\|medium\|low`) at which a **fixable** OSV finding blocks the pipeline. No-fix-yet / below-threshold → warning only. |
 
 ## Secrets
 
