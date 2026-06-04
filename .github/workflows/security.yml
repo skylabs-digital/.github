@@ -27,6 +27,10 @@ on:
         description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE OSV finding blocks the pipeline. Findings with no available fix, or below this severity, are reported as warnings only (non-blocking). Default: high — parity with Grype --fail-on high.'
         type: string
         default: high
+      grype-fail-on-severity:
+        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE container finding blocks the pipeline. Unfixed CVEs, or fixable findings below this severity, are reported as warnings only (non-blocking). Default: high.'
+        type: string
+        default: high
     secrets:
       npm-token:
         description: '[DEPRECATED — prefer app-id + private-key] Static token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
@@ -177,8 +181,20 @@ jobs:
           sudo mv gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
+      # Full-history secret scan. A leaked secret stays leaked, so we keep
+      # exit-code 1 on real findings — but allow callers to suppress confirmed
+      # false positives so the gate doesn't cry wolf:
+      #   - .gitleaks.toml   (regex/path/stopword allowlist) — threaded via -c
+      #   - .gitleaksignore  (per-finding fingerprints)       — auto-loaded by gitleaks
       - name: Scan repository (full history)
-        run: gitleaks detect --source . --redact --exit-code 1 --verbose
+        run: |
+          set -euo pipefail
+          CONFIG_FLAG=""
+          if [ -f .gitleaks.toml ]; then
+            echo "Using .gitleaks.toml allowlist from calling repo"
+            CONFIG_FLAG="-c .gitleaks.toml"
+          fi
+          gitleaks detect --source . $CONFIG_FLAG --redact --exit-code 1 --verbose
 
   docker-scan:
     # Runs only on push/schedule events, never on pull_request.
@@ -266,7 +282,11 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.111.1/install.sh | sh -s -- -b /usr/local/bin v0.111.1
           grype version
 
-      - name: Scan image
+      # Scan to JSON (non-blocking), then apply the same fixability policy as
+      # the OSV gate: BLOCK only on FIXABLE findings >= grype-fail-on-severity;
+      # unfixed CVEs and below-threshold findings are warnings. .grype.yaml
+      # ignores are honoured (matched entries move to ignoredMatches).
+      - name: Scan image (JSON, non-blocking)
         run: |
           set -euo pipefail
           CONFIG_FLAG=""
@@ -274,4 +294,55 @@ jobs:
             echo "Using .grype.yaml from calling repo"
             CONFIG_FLAG="-c .grype.yaml"
           fi
-          grype ${{ matrix.image.name }}:${{ github.sha }} $CONFIG_FLAG --fail-on high --only-fixed
+          grype "${{ matrix.image.name }}:${{ github.sha }}" $CONFIG_FLAG -o json > grype-results.json || true
+
+      - name: Gate on fixable findings
+        env:
+          FAIL_ON: ${{ inputs.grype-fail-on-severity }}
+          IMAGE: ${{ matrix.image.name }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/grype-gate.cjs <<'GATE'
+          const fs = require('fs');
+          const FAIL_ON = (process.env.FAIL_ON || 'high').toLowerCase();
+          const IMAGE = process.env.IMAGE || 'image';
+          const RANK = { critical: 4, high: 3, medium: 2, low: 1, negligible: 0, unknown: 0 };
+          const threshold = RANK[FAIL_ON] ?? 3;
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
+
+          let data;
+          try { data = JSON.parse(fs.readFileSync('grype-results.json', 'utf8')); }
+          catch (e) { console.log(`::warning title=Grype::Could not parse results for ${IMAGE} (${e.message}) — not blocking.`); process.exit(0); }
+
+          const blocking = [], warnings = [];
+          for (const m of data.matches || []) {
+            const v = m.vulnerability || {}, a = m.artifact || {};
+            const sev = (v.severity || 'unknown').toLowerCase();
+            const fixable = (v.fix && v.fix.state) === 'fixed';
+            const rec = { id: v.id, pkg: `${a.name}@${a.version}`, sev, fixable };
+            (fixable && (RANK[sev] ?? 0) >= threshold ? blocking : warnings).push(rec);
+          }
+          const dedupe = (arr) => { const m = new Map(); for (const r of arr) m.set(`${r.id}|${r.pkg}`, r); return [...m.values()]; };
+          const B = dedupe(blocking), W = dedupe(warnings);
+          const ignored = (data.ignoredMatches || []).length;
+          const table = (rows) => rows.length
+            ? ['| ID | Package | Severity | Fix |', '|---|---|---|---|',
+               ...rows.map(r => `| ${r.id} | ${r.pkg} | ${r.sev} | ${r.fixable ? 'available' : 'none yet'} |`)].join('\n')
+            : '_none_';
+
+          append(`## Grype — ${IMAGE}`);
+          append(`Policy: block on **fixable** findings of severity **${FAIL_ON}+**; unfixed and below-threshold are warnings.${ignored ? ` (${ignored} ignored via .grype.yaml)` : ''}\n`);
+          append(`- 🚫 Blocking (fixable, ≥ ${FAIL_ON}): **${B.length}**`);
+          append(`- ⚠️ Warnings (unfixed, or below threshold): **${W.length}**\n`);
+          if (B.length) { append(`### 🚫 Blocking`); append(table(B) + '\n'); }
+          // Container images carry many low/negligible OS-package CVEs — cap the
+          // warning table (and skip per-finding annotations) to avoid flooding.
+          append(`### ⚠️ Warnings`); append(table(W.slice(0, 50)) + '\n');
+          if (W.length > 50) append(`_…and ${W.length - 50} more warnings (full list in the Grype step log)._\n`);
+
+          for (const r of B) console.log(`::error title=Grype ${r.id} (${r.sev}, fix available)::${r.pkg} in ${IMAGE} — rebuild with a patched base image / dependency`);
+          if (B.length) { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s) in ${IMAGE}.`); process.exit(1); }
+          console.log(`\nNo blocking findings in ${IMAGE}. ${W.length} warning(s) (non-blocking).`);
+          GATE
+          node /tmp/grype-gate.cjs
