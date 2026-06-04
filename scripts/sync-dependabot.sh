@@ -5,10 +5,13 @@
 #   - Dockerfile dirs (any dir with Dockerfile* not under node_modules/.git/dist/build)
 #   - npm workspace dirs (any dir with package.json, same exclusions)
 #
-# Behaviour:
-#   - Routine updates: patch + minor only (no majors)
-#   - Security advisory PRs: bypass these rules and may bump to a major
-#     (requires `vulnerability-alerts` and `automated-security-fixes` enabled)
+# Behaviour (security-only, low-noise — see docs/standards/dependabot-noise-policy.md):
+#   - open-pull-requests-limit: 0  → NO routine version-update PRs.
+#   - Security-update PRs still flow (exempt from the limit) for ALL deps, but
+#     `ignore: version-update:semver-major` suppresses major bumps, so only
+#     patch/minor vuln fixes auto-PR. Major fixes surface as Dependabot alerts +
+#     the OSV CI warning (verify by hand).
+#   - Requires org-level Dependabot alerts + security updates enabled.
 #
 # Usage:
 #   sync-dependabot.sh [--dry-run] <repo-path>
@@ -44,6 +47,8 @@ done < <(
     -not -path '*/.next/*' \
     -not -path '*/.yarn/*' \
     -not -path '*/.worktrees/*' \
+    -not -path '*/.claude/*' \
+    -not -path '*/.stryker-tmp/*' \
     -not -path '*/.windsurf/*' \
     2>/dev/null \
     | xargs -I{} dirname {} \
@@ -64,6 +69,8 @@ done < <(
     -not -path '*/.next/*' \
     -not -path '*/.yarn/*' \
     -not -path '*/.worktrees/*' \
+    -not -path '*/.claude/*' \
+    -not -path '*/.stryker-tmp/*' \
     -not -path '*/.windsurf/*' \
     2>/dev/null \
     | xargs -I{} dirname {} \
@@ -76,9 +83,10 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
-    groups:
-      actions:
-        patterns: [\"*\"]
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: \"*\"
+        update-types: [\"version-update:semver-major\"]
 "
 
 for d in "${DOCKER_DIRS[@]:-}"; do
@@ -87,12 +95,10 @@ for d in "${DOCKER_DIRS[@]:-}"; do
   - package-ecosystem: docker
     directory: $d
     schedule: { interval: weekly }
+    open-pull-requests-limit: 0
     ignore:
       - dependency-name: \"*\"
         update-types: [\"version-update:semver-major\"]
-    groups:
-      docker:
-        patterns: [\"*\"]
 "
 done
 
@@ -102,14 +108,10 @@ for d in "${NPM_DIRS[@]:-}"; do
   - package-ecosystem: npm
     directory: $d
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
-    groups:
-      dev-deps:
-        dependency-type: development
-        update-types: [patch, minor]
-      prod-deps:
-        dependency-type: production
-        update-types: [patch, minor]
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: \"*\"
+        update-types: [\"version-update:semver-major\"]
 "
 done
 
