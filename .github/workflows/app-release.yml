@@ -73,8 +73,12 @@ on:
         description: >-
           JSON array of service objects. Each:
           {name, kind(backend|static|worker), dockerfile, context?(default "."),
-           healthPath?, hasMigrations?(bool)}. Single source of truth for
+           healthPath?, hasMigrations?(bool), smokeUrl?,
+           restartsWorker?(compose service name)}. Single source of truth for
           static-checks + build + deploy + security docker-images.
+          `restartsWorker`: a compose service that reuses THIS service's image
+          (command override, no image of its own) — force-recreated with the
+          freshly-deployed tag right after this service deploys.
         type: string
         required: true
       deploy-env:
@@ -335,6 +339,10 @@ jobs:
       IMAGE_NAME: ${{ github.repository_owner }}/${{ matrix.service.name }}
       TAG: v${{ needs.version.outputs.version }}
       DEPLOY_ENV: ${{ inputs.deploy-env }}
+      # Optional: a worker compose service that reuses THIS service's image
+      # (command override, no image of its own). Empty for services that don't
+      # declare it; the "Restart worker" step is gated on it.
+      RESTARTS_WORKER: ${{ matrix.service.restartsWorker }}
     steps:
       - name: Apply migrations (isolated migrator)
         # Apply committed migrations via the isolated one-shot <app>-migrator
@@ -398,6 +406,52 @@ jobs:
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
             docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
             /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
+
+      - name: Restart worker (shared image)
+        # A worker service that reuses THIS backend's image (command override, no
+        # image of its own) is NOT a deploy-matrix entry, so the per-service
+        # deploy above never touches it. When the service declares
+        # `restartsWorker`, force-recreate that compose service with the SAME
+        # freshly-deployed tag so the worker runs the new code too. Without this
+        # the worker silently rots on a stale image while the api updates every
+        # release (observed in resuelto: month-old worker → Notification Engine
+        # "Missing variable" render failures because the worker's payload lagged
+        # the template). Runs only when `restartsWorker` is set.
+        if: ${{ matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null }}
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ vars.QA_PRIVATE_IP }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          proxy_host: ${{ vars.BASTION_HOST }}
+          proxy_port: ${{ vars.BASTION_SSH_PORT }}
+          proxy_username: deploy
+          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: SERVICE_NAME,TAG,DEPLOY_ENV,RESTARTS_WORKER
+          script: |
+            set -e
+            cd /opt/skylabs
+            # The worker's compose image is pinned to ${<APP>_API_TAG:-latest}
+            # (same var the isolated migrator uses). Export the freshly-deployed
+            # tag so `up -d --force-recreate` lands the worker on the NEW image.
+            # --env-file is REQUIRED so ${<APP>_*} interpolate in the worker's
+            # compose `environment:` block (mirrors the migrator step above).
+            # NO `|| true`: a failed recreate MUST fail the deploy (→ rollback),
+            # never silently leave the worker on stale code (that footgun is the
+            # whole reason this step exists).
+            COMPOSE="docker compose --env-file /opt/skylabs/.env -f compose.yml -f compose.${DEPLOY_ENV}.yml"
+            APP="${SERVICE_NAME%-*}"
+            TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
+            echo "== Recreating worker ${RESTARTS_WORKER} @ ${TAG} (via ${TAG_VAR}) =="
+            env "${TAG_VAR}=${TAG}" ${COMPOSE} up -d --no-deps --force-recreate "${RESTARTS_WORKER}"
+            # Observability: surface the image the worker now runs so drift is
+            # visible straight from the deploy log. Never fails the step.
+            WORKER_CID=$(${COMPOSE} ps -q "${RESTARTS_WORKER}" 2>/dev/null || true)
+            if [ -n "${WORKER_CID}" ]; then
+              echo "Worker ${RESTARTS_WORKER} now running image: $(docker inspect --format '{{.Config.Image}}' "${WORKER_CID}" 2>/dev/null || echo unknown)"
+            else
+              echo "::warning::Could not resolve container id for ${RESTARTS_WORKER} after recreate"
+            fi
 
       - name: Smoke test
         # Per-service smoke URL for multi-host apps: a service served on a
