@@ -257,7 +257,42 @@ jobs:
           git add -A
           git commit -m "chore(release): v${NEW} [skip ci]"
           git tag -a "v${NEW}" -m "Release v${NEW}"
-          git push origin HEAD:main --follow-tags
+
+          # Push the release commit and its tag ATOMICALLY, rebasing onto
+          # anything that landed on main while this job ran.
+          #
+          # The previous `git push origin HEAD:main --follow-tags` updated each
+          # ref independently: when the branch was rejected non-fast-forward
+          # (any concurrent push — a teammate, dependabot, a merge) the TAG had
+          # already been created. That left an orphan tag pointing at a commit
+          # never reachable from main, no images built, and the next run
+          # skipping that version via the collision guard above. Observed twice
+          # on kommi (v0.3.2, v0.3.3 — both deleted by hand).
+          #
+          # --atomic makes it all-or-nothing, so a rejected branch update can no
+          # longer leave a tag behind; the retry then makes the common case
+          # succeed instead of just failing cleanly.
+          PUSHED=false
+          for attempt in 1 2 3; do
+            if git push --atomic origin HEAD:main "refs/tags/v${NEW}"; then
+              PUSHED=true
+              break
+            fi
+            echo "Push attempt ${attempt} rejected — rebasing onto origin/main and retrying"
+            git fetch --quiet origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "::error::Release commit conflicts with main; resolve manually."
+              exit 1
+            fi
+            # The tag must follow the rebased commit, not the pre-rebase one.
+            git tag -f -a "v${NEW}" -m "Release v${NEW}"
+            sleep $((attempt * 3))
+          done
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::Could not push release v${NEW} after 3 attempts (main kept moving)."
+            exit 1
+          fi
 
           echo "bumped=true" >> $GITHUB_OUTPUT
           echo "version=${NEW}" >> $GITHUB_OUTPUT
