@@ -13,6 +13,14 @@
 #     the OSV CI warning (verify by hand).
 #   - Requires org-level Dependabot alerts + security updates enabled.
 #
+# Private registry:
+#   Repos that consume @skylabs-digital/* packages get a `registries:` block so
+#   Dependabot can authenticate against GitHub Packages. Without it the updater
+#   hits 401 "authentication token not provided" on every private tarball and
+#   resolves the tree blind. The token comes from the ORG-LEVEL DEPENDABOT
+#   secret GHCR_TOKEN (Dependabot has its own secret store — Actions secrets are
+#   NOT visible to it). See docs/standards/dependabot-noise-policy.md.
+#
 # Usage:
 #   sync-dependabot.sh [--dry-run] <repo-path>
 
@@ -78,8 +86,43 @@ done < <(
     | sed 's|^\./||; s|^\.$|/|; s|^\([^/]\)|/\1|'
 )
 
+# Detect consumption of private @skylabs-digital/* packages. Only dependency
+# sections count — a lib whose own `name` is @skylabs-digital/* but that
+# consumes nothing private needs no registry.
+HAS_PRIVATE_DEPS=0
+for d in "${NPM_DIRS[@]:-}"; do
+  [[ -z "$d" ]] && continue
+  pkg=".${d%/}/package.json"
+  pkg="${pkg//\/\///}"
+  [[ -f "$pkg" ]] || continue
+  if node -e "
+    const p = require('$PWD/${pkg#./}');
+    const deps = {...p.dependencies, ...p.devDependencies, ...p.peerDependencies};
+    process.exit(Object.keys(deps).some(d => d.startsWith('@skylabs-digital/')) ? 0 : 1);
+  " 2>/dev/null; then
+    HAS_PRIVATE_DEPS=1
+    break
+  fi
+done
+
+# npm entries reference the registry only when the repo consumes private deps.
+NPM_REGISTRY_REF=""
+REGISTRIES_BLOCK=""
+if [[ $HAS_PRIVATE_DEPS -eq 1 ]]; then
+  REGISTRIES_BLOCK="registries:
+  npm-github:
+    type: npm-registry
+    url: https://npm.pkg.github.com
+    token: \${{secrets.GHCR_TOKEN}}
+
+"
+  NPM_REGISTRY_REF="    registries:
+      - npm-github
+"
+fi
+
 OUTPUT="version: 2
-updates:
+${REGISTRIES_BLOCK}updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
@@ -109,7 +152,7 @@ for d in "${NPM_DIRS[@]:-}"; do
     directory: $d
     schedule: { interval: weekly }
     open-pull-requests-limit: 0
-    ignore:
+${NPM_REGISTRY_REF}    ignore:
       - dependency-name: \"*\"
         update-types: [\"version-update:semver-major\"]
 "
