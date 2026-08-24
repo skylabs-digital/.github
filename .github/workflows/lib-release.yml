@@ -70,7 +70,7 @@ on:
         type: boolean
         default: true
       coverage-floor:
-        description: 'Coverage floor percent (forwarded as COVERAGE_FLOOR; enforced by the lib vitest config)'
+        description: 'DEPRECATED (sl-8a5): accepted for caller compatibility only — nothing in this reusable reads it. Enforce coverage in the lib vitest config (coverage-discipline.md). Callers drop it in the weekly sweep; the input is removed once no caller passes it.'
         type: number
         default: 90
     secrets:
@@ -93,7 +93,6 @@ jobs:
     name: CI (typecheck + lint + test)
     runs-on: [self-hosted, linux, x64, skylabs]
     env:
-      COVERAGE_FLOOR: ${{ inputs.coverage-floor }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -157,6 +156,12 @@ jobs:
         # NON-BLOCKING: we capture Stryker's exit code and always exit 0. A
         # threshold regression becomes a ::warning:: + job summary, not a failure.
         run: |
+          # GitHub Actions runs `run:` steps with `bash -e -o pipefail`; `set -uo`
+          # does NOT clear the inherited -e, so `yarn test:mutation; rc=$?` used to
+          # abort the script on Stryker's exit 1 before reaching `exit 0` — the
+          # "non-blocking" step blocked releases (sl-1qu, testlab-review run
+          # 32508327098). `set +e` makes the contract real.
+          set +e
           set -uo pipefail   # NOT -e: we handle the exit code ourselves
           if node -e "const s=require('./package.json').scripts||{};process.exit(s['test:mutation']?0:1)"; then
             yarn test:mutation; rc=$?
