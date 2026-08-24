@@ -1,0 +1,56 @@
+name: CI (reusables lint)
+
+# El repo org no tenía CI propio: un reusable inválido (ej. un `env:` vacío,
+# que PyYAML acepta y el parser de GitHub no) solo se manifestaba como un run
+# stub "workflow file issue" post-push — y en main rompería a los 25
+# consumidores en el acto. Bead sl-bh3 (wrapper), análisis
+# 2026-08-24-pipeline-drift-assessment.md (Addendum).
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/**'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: actionlint + parser checks
+    runs-on: [self-hosted, linux, x64, skylabs]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # actionlint valida schema de workflows, expresiones ${{ }} y shellcheck
+      # de los bloques run:. Imagen pineada por tag inmutable del proyecto.
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+      # Lo que actionlint no cubre y ya nos mordió: mappings vacíos (env:/with:/
+      # secrets:/permissions:/outputs: con valor null) — PyYAML los acepta, el
+      # parser de GitHub no, y el resultado es el stub "workflow file issue".
+      - name: Empty-mapping check
+        run: |
+          python3 - <<'PY'
+          import sys, yaml, glob
+          bad = []
+          for f in glob.glob('.github/workflows/*.yml'):
+              d = yaml.safe_load(open(f))
+              def walk(o, p=''):
+                  if isinstance(o, dict):
+                      for k, v in o.items():
+                          if v is None and k in ('env', 'with', 'secrets', 'permissions', 'outputs', 'inputs'):
+                              bad.append(f'{f}: {p}/{k} es un mapping vacío')
+                          walk(v, f'{p}/{k}')
+                  elif isinstance(o, list):
+                      for i, v in enumerate(o): walk(v, f'{p}[{i}]')
+              walk(d)
+          for b in bad: print(f'::error::{b}')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: shellcheck de scripts/
+        run: |
+          if ls scripts/*.sh >/dev/null 2>&1; then
+            docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:v0.11.0 scripts/*.sh
+          fi
