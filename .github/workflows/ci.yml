@@ -23,8 +23,15 @@ jobs:
 
       # actionlint valida schema de workflows, expresiones ${{ }} y shellcheck
       # de los bloques run:. Imagen pineada por tag inmutable del proyecto.
+      # SHELLCHECK_OPTS: los reusables acumulan findings info-level (SC2086
+      # quoting, SC2209/SC2015 falsos positivos como BUMP=patch); se excluyen
+      # para que el gate solo bloquee errores reales — limpieza de quoting
+      # trackeada en beads (github-*, hygiene shellcheck).
       - name: actionlint
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+        run: >
+          docker run --rm -v "$PWD:/repo" -w /repo
+          -e SHELLCHECK_OPTS='--exclude=SC2086,SC2209,SC2015'
+          rhysd/actionlint:1.7.7 -color
 
       # Lo que actionlint no cubre y ya nos mordió: mappings vacíos (env:/with:/
       # secrets:/permissions:/outputs: con valor null) — PyYAML los acepta, el

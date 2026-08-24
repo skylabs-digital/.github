@@ -1,0 +1,6 @@
+# Config de actionlint para el CI de reusables (ci.yml).
+self-hosted-runner:
+  # Labels custom de los runners de la org; sin esto actionlint marca
+  # runner-label error en cada `runs-on: [self-hosted, linux, x64, skylabs]`.
+  labels:
+    - skylabs

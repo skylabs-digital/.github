@@ -58,8 +58,7 @@ done < <(
     -not -path '*/.claude/*' \
     -not -path '*/.stryker-tmp/*' \
     -not -path '*/.windsurf/*' \
-    2>/dev/null \
-    | xargs -I{} dirname {} \
+    -exec dirname {} + 2>/dev/null \
     | sort -u \
     | sed 's|^\./||; s|^\.$|/|; s|^\([^/]\)|/\1|'
 )
@@ -80,8 +79,7 @@ done < <(
     -not -path '*/.claude/*' \
     -not -path '*/.stryker-tmp/*' \
     -not -path '*/.windsurf/*' \
-    2>/dev/null \
-    | xargs -I{} dirname {} \
+    -exec dirname {} + 2>/dev/null \
     | sort -u \
     | sed 's|^\./||; s|^\.$|/|; s|^\([^/]\)|/\1|'
 )
