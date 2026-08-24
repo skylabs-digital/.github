@@ -379,17 +379,19 @@ jobs:
   # ============================================================
   # WEEKLY ROLLING ISSUE (schedule only) — gate policy v2.
   # One issue per repo (label weekly-security-review), updated in place: the
-  # Monday fleet review reads these instead of red runs. Requires the CALLER's
-  # workflow to grant `issues: write`; until that fan-out lands the step is
-  # continue-on-error so a missing permission never affects the run.
+  # Monday fleet review reads these instead of red runs. Needs the CALLER's
+  # workflow to grant `issues: write` — but this job must NOT declare it in a
+  # `permissions:` block: in a reusable workflow, a job-level request the
+  # caller doesn't grant is rejected at compile time (startup_failure for the
+  # ENTIRE run, on every event, before continue-on-error can apply). Inherit
+  # the caller's permissions instead; without the grant the upsert step 403s
+  # at runtime and continue-on-error keeps the run green.
   # ============================================================
   weekly-security-report:
     name: Weekly security review (rolling issue)
     if: ${{ always() && github.event_name == 'schedule' && !inputs.gitleaks-only }}
     needs: [osv-scan]
     runs-on: [self-hosted, linux, x64, skylabs]
-    permissions:
-      issues: write
     steps:
       - name: Upsert rolling issue
         continue-on-error: true
