@@ -24,13 +24,17 @@ on:
           --recursive
           ./
       osv-fail-on-severity:
-        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE OSV finding blocks the pipeline. Findings with no available fix, or below this severity, are reported as warnings only (non-blocking). Default: high — parity with Grype --fail-on high.'
+        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE OSV finding blocks the pipeline when the gate is in block mode. Findings with no available fix, or below this severity, are always warnings. Default: critical (gate policy v2, 2026-08-24 — high left 22/24 weekly schedules red on transitive devDeps; see cicd-security-reusable.md).'
         type: string
-        default: high
+        default: critical
       grype-fail-on-severity:
-        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE container finding blocks the pipeline. Unfixed CVEs, or fixable findings below this severity, are reported as warnings only (non-blocking). Default: high.'
+        description: 'Minimum severity (critical|high|medium|low) at which a FIXABLE container finding blocks the pipeline when the gate is in block mode. Unfixed CVEs, or fixable findings below this severity, are always warnings. Default: critical (gate policy v2).'
         type: string
-        default: high
+        default: critical
+      gate-mode:
+        description: 'auto | block | report. auto (default) = block on push, report on pull_request/schedule. report mode never fails the job: findings land in the summary/annotations, and on schedule the weekly-security-report job upserts one rolling issue per repo (label weekly-security-review). Gitleaks always blocks regardless of mode.'
+        type: string
+        default: auto
     secrets:
       npm-token:
         description: '[DEPRECATED — prefer app-id + private-key] Static token for private @skylabs-digital npm packages, injected as --mount=type=secret,id=npm_token during Docker builds.'
@@ -47,6 +51,8 @@ jobs:
     if: ${{ !inputs.gitleaks-only }}
     name: OSV-Scanner (deps)
     runs-on: [self-hosted, linux, x64, skylabs]
+    outputs:
+      summary_b64: ${{ steps.gate.outputs.summary_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
@@ -71,14 +77,22 @@ jobs:
       #   WARN   for everything else — no fix available yet, or below threshold.
       # Nothing is silently dropped: all findings are listed in the job summary.
       - name: Gate on fixable findings
+        id: gate
         env:
           FAIL_ON: ${{ inputs.osv-fail-on-severity }}
           OSV_OUTCOME: ${{ steps.osv.outcome }}
+          GATE_MODE: ${{ inputs.gate-mode }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           cat > /tmp/osv-gate.cjs <<'GATE'
           const fs = require('fs');
-          const FAIL_ON = (process.env.FAIL_ON || 'high').toLowerCase();
+          const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
+          // Gate policy v2: block only on push (deploy about to happen); report on
+          // PR (the findings are not the PR's) and schedule (weekly review input).
+          const MODE = (process.env.GATE_MODE || 'auto') === 'auto'
+            ? (process.env.EVENT === 'push' ? 'block' : 'report')
+            : process.env.GATE_MODE;
           const RANK = { critical: 4, high: 3, medium: 2, moderate: 2, low: 1, unknown: 0 };
           const threshold = RANK[FAIL_ON] ?? 3;
           const summaryPath = process.env.GITHUB_STEP_SUMMARY;
@@ -134,17 +148,26 @@ jobs:
             : '_none_';
 
           append(`## OSV-Scanner — dependency vulnerabilities`);
-          append(`Policy: block on **fixable** findings of severity **${FAIL_ON}+**; no-fix-yet and below-threshold are warnings.\n`);
+          append(`Policy: **${MODE}** mode — fixable ≥ **${FAIL_ON}** ${MODE === 'block' ? 'fails this run' : 'is reported (would block a push to main)'}; no-fix-yet and below-threshold are always warnings.\n`);
           append(`- 🚫 Blocking (fixable, ≥ ${FAIL_ON}): **${B.length}**`);
           append(`- ⚠️ Warnings (no fix yet, or below threshold): **${W.length}**\n`);
           if (B.length) { append(`### 🚫 Blocking`); append(table(B) + '\n'); }
           append(`### ⚠️ Warnings`); append(table(W) + '\n');
 
           for (const r of W) console.log(`::warning title=OSV ${r.id} (${r.sev}, ${r.fixable ? 'fix available, below threshold' : 'no fix yet'})::${r.pkg} in ${r.source}`);
-          for (const r of B) console.log(`::error title=OSV ${r.id} (${r.sev}, fix available)::${r.pkg} in ${r.source} — upgrade to a patched version`);
+          const ann = MODE === 'block' ? 'error' : 'warning';
+          for (const r of B) console.log(`::${ann} title=OSV ${r.id} (${r.sev}, fix available)::${r.pkg} in ${r.source} — upgrade to a patched version`);
 
-          if (B.length) { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s).`); process.exit(1); }
-          console.log(`\nNo blocking findings. ${W.length} warning(s) reported (non-blocking).`);
+          // Hand the tables to the weekly-security-report job (rolling issue).
+          if (process.env.GITHUB_OUTPUT) {
+            const md = [`- Blocking-grade (fixable ≥ ${FAIL_ON}): **${B.length}**`, `- Warnings: **${W.length}**`, '',
+                        B.length ? '### Fixable ≥ threshold\n' + table(B) : '', W.length ? '### Warnings\n' + table(W) : ''].join('\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `summary_b64=${Buffer.from(md).toString('base64')}\n`);
+          }
+
+          if (B.length && MODE === 'block') { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s).`); process.exit(1); }
+          if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) would block a push to main — not failing this ${process.env.EVENT} run.`); }
+          else { console.log(`\nNo blocking findings. ${W.length} warning(s) reported (non-blocking).`); }
           GATE
           node /tmp/osv-gate.cjs
 
@@ -229,9 +252,9 @@ jobs:
       - name: Generate GitHub App Token (if configured)
         id: app-token
         if: steps.has-app.outputs.available == 'true'
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
         with:
-          app-id: ${{ secrets.app-id }}
+          client-id: ${{ secrets.app-id }}
           private-key: ${{ secrets.private-key }}
           owner: ${{ github.repository_owner }}
 
@@ -300,11 +323,16 @@ jobs:
         env:
           FAIL_ON: ${{ inputs.grype-fail-on-severity }}
           IMAGE: ${{ matrix.image.name }}
+          GATE_MODE: ${{ inputs.gate-mode }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           cat > /tmp/grype-gate.cjs <<'GATE'
           const fs = require('fs');
-          const FAIL_ON = (process.env.FAIL_ON || 'high').toLowerCase();
+          const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
+          const MODE = (process.env.GATE_MODE || 'auto') === 'auto'
+            ? (process.env.EVENT === 'push' ? 'block' : 'report')
+            : process.env.GATE_MODE;
           const IMAGE = process.env.IMAGE || 'image';
           const RANK = { critical: 4, high: 3, medium: 2, low: 1, negligible: 0, unknown: 0 };
           const threshold = RANK[FAIL_ON] ?? 3;
@@ -342,7 +370,53 @@ jobs:
           if (W.length > 50) append(`_…and ${W.length - 50} more warnings (full list in the Grype step log)._\n`);
 
           for (const r of B) console.log(`::error title=Grype ${r.id} (${r.sev}, fix available)::${r.pkg} in ${IMAGE} — rebuild with a patched base image / dependency`);
-          if (B.length) { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s) in ${IMAGE}.`); process.exit(1); }
-          console.log(`\nNo blocking findings in ${IMAGE}. ${W.length} warning(s) (non-blocking).`);
+          if (B.length && MODE === 'block') { console.error(`\nBlocking: ${B.length} fixable ${FAIL_ON}+ vuln(s) in ${IMAGE}.`); process.exit(1); }
+          if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) in ${IMAGE} would block a push to main — not failing this ${process.env.EVENT} run.`); }
+          else { console.log(`\nNo blocking findings in ${IMAGE}. ${W.length} warning(s) (non-blocking).`); }
           GATE
           node /tmp/grype-gate.cjs
+
+  # ============================================================
+  # WEEKLY ROLLING ISSUE (schedule only) — gate policy v2.
+  # One issue per repo (label weekly-security-review), updated in place: the
+  # Monday fleet review reads these instead of red runs. Requires the CALLER's
+  # workflow to grant `issues: write`; until that fan-out lands the step is
+  # continue-on-error so a missing permission never affects the run.
+  # ============================================================
+  weekly-security-report:
+    name: Weekly security review (rolling issue)
+    if: ${{ always() && github.event_name == 'schedule' && !inputs.gitleaks-only }}
+    needs: [osv-scan]
+    runs-on: [self-hosted, linux, x64, skylabs]
+    permissions:
+      issues: write
+    steps:
+      - name: Upsert rolling issue
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        env:
+          SUMMARY_B64: ${{ needs.osv-scan.outputs.summary_b64 }}
+        with:
+          script: |
+            const label = 'weekly-security-review';
+            const b64 = process.env.SUMMARY_B64 || '';
+            const body = [
+              `## Weekly security review — ${new Date().toISOString().slice(0, 10)}`,
+              '',
+              b64 ? Buffer.from(b64, 'base64').toString('utf8') : '_OSV summary unavailable (job skipped or failed)._',
+              '',
+              `Container (Grype) detail and Gitleaks: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '_Actualizado automáticamente por security.yml (gate policy v2). Triage: weekly-fleet-review.md (wrapper)._',
+            ].join('\n');
+            try {
+              await github.rest.issues.createLabel({ ...context.repo, name: label, color: '1d76db', description: 'Rolling weekly security review (gate policy v2)' });
+            } catch (e) { if (e.status !== 422) throw e; }
+            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, labels: label, state: 'open', per_page: 1 });
+            if (open.length) {
+              await github.rest.issues.update({ ...context.repo, issue_number: open[0].number, body });
+              core.info(`updated #${open[0].number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({ ...context.repo, title: 'Weekly security review', labels: [label], body });
+              core.info(`created #${created.number}`);
+            }
