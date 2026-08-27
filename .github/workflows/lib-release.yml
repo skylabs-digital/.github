@@ -73,6 +73,39 @@ on:
         description: 'DEPRECATED (sl-8a5): accepted for caller compatibility only — nothing in this reusable reads it. Enforce coverage in the lib vitest config (coverage-discipline.md). Callers drop it in the weekly sweep; the input is removed once no caller passes it.'
         type: number
         default: 90
+      # ----------------------------------------------------------------
+      # Repo-specific gates (sl-eab / react-identity-access-eab).
+      #
+      # THE PROBLEM THIS SOLVES. This reusable does NOT invoke `yarn ci`: the
+      # `ci` job below runs four hardcoded steps. So any gate a lib adds to its
+      # own `ci` script exists in that repo's pre-push hook and NOWHERE in CI.
+      # The repo believes it has a gate and it does not. Today the workaround is
+      # to inline a whole extra job in the caller — which costs an entire
+      # `yarn install` per gate, per repo (react-identity-access ships a
+      # `repo-gates` job for exactly this).
+      #
+      # WHY TWO HOOKS AND NOT ONE. Real gates land on both sides of the build:
+      #   before  spec-check, ast-check, docs-check — static, cheap, fail fast
+      #   after   dual-format smoke tests, bundle-size budgets, `npm pack`
+      #           checks — they need `dist/` to exist
+      # A single hook forces the second kind to either re-build or not run.
+      #
+      # BOTH DEFAULT TO EMPTY, so the steps are skipped and the ~18 current
+      # callers are byte-for-byte unaffected. Opt-in, additive, no contract
+      # change.
+      #
+      # WHY NOT "just run `yarn ci` when the script exists": it changes the
+      # contract for all 18 callers at once, and any repo with a heavier `ci`
+      # silently gets a longer pipeline it never asked for.
+      # ----------------------------------------------------------------
+      extra-ci-steps:
+        description: 'Shell to run inside the `ci` job AFTER Lint and BEFORE Test. For static repo-specific gates (spec-check, ast-check, docs-check). Empty = skipped.'
+        type: string
+        default: ''
+      extra-ci-steps-post-build:
+        description: 'Shell to run inside the `ci` job AFTER Build. For gates that need `dist/` (dual-format smoke, pack checks, size budgets). Empty = skipped.'
+        type: string
+        default: ''
     secrets:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages + write:packages) for private npm deps + GitHub Packages publish'
@@ -111,10 +144,22 @@ jobs:
         run: yarn typecheck
       - name: Lint
         run: yarn lint
+      # Repo-specific static gates. Skipped unless the caller passes them, so
+      # the ~18 existing callers see no change. Reuses the install above, which
+      # is the whole point: an inlined per-gate job pays for `yarn install`
+      # again, per gate, per repo.
+      - name: Repo gates (pre-build)
+        if: ${{ inputs.extra-ci-steps != '' }}
+        run: ${{ inputs.extra-ci-steps }}
       - name: Test (coverage)
         run: yarn test --coverage
       - name: Build
         run: yarn build
+      # Repo-specific gates that need `dist/` — dual-format smoke tests, pack
+      # checks, bundle-size budgets. This is why one hook was not enough.
+      - name: Repo gates (post-build)
+        if: ${{ inputs.extra-ci-steps-post-build != '' }}
+        run: ${{ inputs.extra-ci-steps-post-build }}
 
   # ============================================================
   # STAGE 1 — MUTATION (Stryker incremental) — INFORMATIVE PARALLEL CHECK
