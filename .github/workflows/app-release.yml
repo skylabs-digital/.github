@@ -52,10 +52,12 @@ name: App Release (reusable)
 #           ]
 #       secrets: inherit
 #
-# `services` is the SINGLE SOURCE OF TRUTH: it drives static-checks, build,
-# deploy AND the security reusable's docker-images list. `secrets: inherit`
-# passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY, DEPLOY_SSH_KEY and
-# the org-level vars through automatically.
+# `services` is the SINGLE SOURCE OF TRUTH for build, deploy AND the security
+# reusable's docker-images list. It no longer drives static-checks: that gate is
+# repo-wide and runs once, independent of how many services a repo ships.
+#
+# `secrets: inherit` passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY,
+# DEPLOY_SSH_KEY and the org-level vars through automatically.
 # ============================================================================
 
 on:
@@ -75,7 +77,8 @@ on:
           {name, kind(backend|static|worker), dockerfile, context?(default "."),
            healthPath?, hasMigrations?(bool), smokeUrl?,
            restartsWorker?(compose service name)}. Single source of truth for
-          static-checks + build + deploy + security docker-images.
+          build + deploy + security docker-images (NOT static-checks, which is
+          repo-wide and runs once).
           `restartsWorker`: a compose service that reuses THIS service's image
           (command override, no image of its own) — force-recreated with the
           freshly-deployed tag right after this service deploys.
@@ -110,17 +113,32 @@ on:
 jobs:
   # ============================================================
   # STAGE 1 — STATIC CHECKS
-  # One matrix entry per service. `yarn ci` is the canonical per-workspace
-  # gate (typecheck + lint + test + build). Runs on every event.
+  # `yarn ci` is the repo-wide gate: typecheck + lint + test + build across
+  # every workspace. It runs ONCE. Until 2026-08-27 this was a matrix over
+  # `services`, but `matrix.service` only ever reached the job NAME — never the
+  # command — so every leg re-ran the identical repo-wide gate. Three services
+  # meant three full copies per PR.
+  #
+  # That redundancy was not just waste, it was the failure. Node sizes its
+  # old-space heap from the memory AVAILABLE AT STARTUP, so N copies of a
+  # monorepo CI racing on one self-hosted runner means whichever leg starts last
+  # gets a small heap and dies with "Ineffective mark-compacts near heap limit",
+  # exit 129, before printing a line. Measured on resuelto (resuelto-5nw4): at
+  # one commit, resuelto-api passed in 9m29s, resuelto-bo passed in 10m28s, and
+  # resuelto-web died in 1m31s — same commit, same command, same code. A control
+  # run on the last green commit had all three pass, so the runner is healthy;
+  # the concurrency is what did not fit.
+  #
+  # BREAKING for consumers: this replaces N contexts named
+  # "Static checks (<service>)" with a single "Static checks". Any ruleset that
+  # requires the old strings by exact context will never see them again and will
+  # block every PR until it is updated. Consumers track @main, so this lands on
+  # all of them at once — deliberately, with the fleet owner's call.
   # ============================================================
   static-checks:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule'
-    name: Static checks (${{ matrix.service.name }})
+    name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        service: ${{ fromJson(inputs.services) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - run: corepack enable
