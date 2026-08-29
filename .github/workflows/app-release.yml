@@ -218,16 +218,51 @@ jobs:
         run: |
           set -euo pipefail
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          COMMITS=$([ -z "$LAST_TAG" ] && git log --oneline || git log "${LAST_TAG}..HEAD" --oneline)
+          RANGE=$([ -z "$LAST_TAG" ] && echo "" || echo "${LAST_TAG}..HEAD")
 
-          if echo "$COMMITS" | grep -qiE "^[a-f0-9]+ (BREAKING CHANGE|feat!|fix!|refactor!):"; then
+          # DOS vistas del rango, a proposito:
+          #   %s -> un subject por linea, para leer type/scope/`!`
+          #   %B -> el mensaje COMPLETO, unica forma de ver el footer
+          # Antes se usaba `--oneline`, que imprime solo el subject. Por eso la
+          # alternativa `BREAKING CHANGE` de la rama major era CODIGO MUERTO: el
+          # footer nunca aparecia en la entrada del grep, y un subject que
+          # empezara con `BREAKING CHANGE:` lo rechaza el `type-enum` de
+          # commitlint. Un breaking declarado como manda la spec no se veia.
+          SUBJECTS=$(git log ${RANGE} --pretty=format:'%s')
+          BODIES=$(git log ${RANGE} --pretty=format:'%B')
+
+          # major: CUALQUIER type, con o sin scope, seguido de `!:`. El patron
+          # viejo listaba literales sin scope (`feat!`, `fix!`, `refactor!`), asi
+          # que `fix(seed)!:` — la forma canonica de Conventional Commits 1.0.0,
+          # y la que `@commitlint/config-conventional` bendice — no matcheaba
+          # NINGUNA de las tres ramas: ni major, ni minor, ni patch. Caia en "no
+          # hay nada que liberar", con la corrida en verde y sin desplegar.
+          # Medido: idachu ca3c4da (2026-08-29) quedo huerfano; resuelto 388ff5b7
+          # y kommi 7311c549 salieron como MINOR siendo breaking.
+          #
+          # `[^)]+` y no `.*` dentro del scope: `.*` es greedy y en un subject con
+          # mas de un `)` se come el cierre y desalinea el patron.
+          if printf '%s\n' "$SUBJECTS" | grep -qiE '^[a-z]+(\([^)]+\))?!:' \
+            || printf '%s\n' "$BODIES" | grep -qE '^BREAKING[ -]CHANGE:'; then
             BUMP=major
-          elif echo "$COMMITS" | grep -qiE "^[a-f0-9]+ feat(\(.*\))?:"; then
+          elif printf '%s\n' "$SUBJECTS" | grep -qiE '^feat(\([^)]+\))?:'; then
             BUMP=minor
-          elif echo "$COMMITS" | grep -qiE "^[a-f0-9]+ (fix|perf|refactor)(\(.*\))?:"; then
+          elif printf '%s\n' "$SUBJECTS" | grep -qiE '^(fix|perf|refactor)(\([^)]+\))?:'; then
             BUMP=patch
           else
-            echo "No releasable commits — skipping bump"
+            # Este camino era MUDO: una linea de stdout enterrada bajo cientos de
+            # `[new tag]`, con la corrida en verde y build/deploy en `skipped`.
+            # Un push a main que no despliega nada tiene que verse.
+            echo "::warning::Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor, y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
+            {
+              echo "### Sin release"
+              echo ""
+              echo "Ningun commit del rango \`${LAST_TAG:-inicio}..HEAD\` es liberable, asi que **no se construyo ni desplego nada**."
+              echo ""
+              echo "Subjects evaluados:"
+              echo ""
+              printf '%s\n' "$SUBJECTS" | sed 's/^/- /'
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "bumped=false" >> $GITHUB_OUTPUT
             echo "version=" >> $GITHUB_OUTPUT
             exit 0
