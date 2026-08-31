@@ -217,133 +217,169 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          RANGE=$([ -z "$LAST_TAG" ] && echo "" || echo "${LAST_TAG}..HEAD")
 
-          # DOS vistas del rango, a proposito:
-          #   %s -> un subject por linea, para leer type/scope/`!`
-          #   %B -> el mensaje COMPLETO, unica forma de ver el footer
-          # Antes se usaba `--oneline`, que imprime solo el subject. Por eso la
-          # alternativa `BREAKING CHANGE` de la rama major era CODIGO MUERTO: el
-          # footer nunca aparecia en la entrada del grep, y un subject que
-          # empezara con `BREAKING CHANGE:` lo rechaza el `type-enum` de
-          # commitlint. Un breaking declarado como manda la spec no se veia.
-          SUBJECTS=$(git log ${RANGE} --pretty=format:'%s')
-          BODIES=$(git log ${RANGE} --pretty=format:'%B')
+          # Todo el calculo de la version -- desde LAST_TAG hasta el commit y
+          # el tag -- vive en esta funcion para poder RECALCULARLO ENTERO en
+          # cada intento del push, no solo reintentar el mismo commit. Un
+          # `return 1` (sin marcar error: `set -e` no mata el script dentro de
+          # un `if !`) senala que no hay nada liberable en el rango ACTUAL --
+          # la misma salida limpia tanto si es el primer intento (push a main
+          # sin commits liberables) como si es un intento posterior (un
+          # release concurrente ya cubrio todo lo que este intento iba a
+          # liberar).
+          compute_release() {
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            RANGE=$([ -z "$LAST_TAG" ] && echo "" || echo "${LAST_TAG}..HEAD")
 
-          # major: CUALQUIER type, con o sin scope, seguido de `!:`. El patron
-          # viejo listaba literales sin scope (`feat!`, `fix!`, `refactor!`), asi
-          # que `fix(seed)!:` — la forma canonica de Conventional Commits 1.0.0,
-          # y la que `@commitlint/config-conventional` bendice — no matcheaba
-          # NINGUNA de las tres ramas: ni major, ni minor, ni patch. Caia en "no
-          # hay nada que liberar", con la corrida en verde y sin desplegar.
-          # Medido: idachu ca3c4da (2026-08-29) quedo huerfano; resuelto 388ff5b7
-          # y kommi 7311c549 salieron como MINOR siendo breaking.
-          #
-          # `[^)]+` y no `.*` dentro del scope: `.*` es greedy y en un subject con
-          # mas de un `)` se come el cierre y desalinea el patron.
-          if printf '%s\n' "$SUBJECTS" | grep -qiE '^[a-z]+(\([^)]+\))?!:' \
-            || printf '%s\n' "$BODIES" | grep -qE '^BREAKING[ -]CHANGE:'; then
-            BUMP=major
-          elif printf '%s\n' "$SUBJECTS" | grep -qiE '^feat(\([^)]+\))?:'; then
-            BUMP=minor
-          elif printf '%s\n' "$SUBJECTS" | grep -qiE '^(fix|perf|refactor)(\([^)]+\))?:'; then
-            BUMP=patch
-          else
-            # Este camino era MUDO: una linea de stdout enterrada bajo cientos de
-            # `[new tag]`, con la corrida en verde y build/deploy en `skipped`.
-            # Un push a main que no despliega nada tiene que verse.
-            echo "::warning::Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor, y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
+            # DOS vistas del rango, a proposito:
+            #   %s -> un subject por linea, para leer type/scope/`!`
+            #   %B -> el mensaje COMPLETO, unica forma de ver el footer
+            SUBJECTS=$(git log ${RANGE} --pretty=format:'%s')
+            BODIES=$(git log ${RANGE} --pretty=format:'%B')
+
+            # major: CUALQUIER type, con o sin scope, seguido de `!:` — la
+            # forma canonica de Conventional Commits 1.0.0. `[^)]+` y no `.*`
+            # dentro del scope: `.*` es greedy y en un subject con mas de un
+            # `)` se come el cierre y desalinea el patron. Las dos vistas del
+            # rango (SUBJECTS/BODIES en vez de solo `--oneline`) son porque el
+            # footer `BREAKING CHANGE:` solo aparece en `%B`; medido: idachu
+            # ca3c4da (2026-08-29) quedo huerfano, resuelto 388ff5b7 y kommi
+            # 7311c549 salieron como MINOR siendo breaking.
+            if printf '%s\n' "$SUBJECTS" | grep -qiE '^[a-z]+(\([^)]+\))?!:' \
+              || printf '%s\n' "$BODIES" | grep -qE '^BREAKING[ -]CHANGE:'; then
+              BUMP=major
+            elif printf '%s\n' "$SUBJECTS" | grep -qiE '^feat(\([^)]+\))?:'; then
+              BUMP=minor
+            elif printf '%s\n' "$SUBJECTS" | grep -qiE '^(fix|perf|refactor)(\([^)]+\))?:'; then
+              BUMP=patch
+            else
+              return 1
+            fi
+
+            CURRENT=$(node -p "require('./package.json').version")
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "$BUMP" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+            NEW="${MAJOR}.${MINOR}.${PATCH}"
+
+            # Tag-collision guard: keep bumping patch until a free slot is found.
+            git fetch --tags --force --quiet origin || true
+            while git rev-parse -q --verify "refs/tags/v${NEW}" >/dev/null 2>&1 \
+               || git ls-remote --exit-code --tags origin "refs/tags/v${NEW}" >/dev/null 2>&1; do
+              echo "Tag v${NEW} already exists — bumping patch"
+              PATCH=$((PATCH + 1))
+              NEW="${MAJOR}.${MINOR}.${PATCH}"
+            done
+
+            echo "Bumping: ${CURRENT} → ${NEW} (${BUMP})"
+
+            # Bump every package.json found (root + workspaces), shallow scan.
+            for pj in package.json */package.json; do
+              [ -f "$pj" ] || continue
+              node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('$pj','utf8'));if(p.version){p.version='$NEW';fs.writeFileSync('$pj',JSON.stringify(p,null,2)+'\n');}"
+            done
+
+            DATE=$(date +%Y-%m-%d)
+            if [ -z "$LAST_TAG" ]; then
+              RANGE_COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
+            else
+              RANGE_COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline --pretty=format:"- %s (%h)")
+            fi
+            ENTRY="## [${NEW}] - ${DATE}\n\n${RANGE_COMMITS}\n"
+            if [ -f CHANGELOG.md ]; then
+              echo -e "# Changelog\n\n${ENTRY}\n$(tail -n +2 CHANGELOG.md)" > CHANGELOG.md
+            else
+              echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
+            fi
+
+            git add -A
+            git commit -m "chore(release): v${NEW} [skip ci]"
+            # `-f`: un reintento puede dejar un tag LOCAL del intento anterior
+            # con el mismo nombre, si el rango no cambio entre intentos.
+            git tag -f -a "v${NEW}" -m "Release v${NEW}"
+          }
+
+          # Escribe la salida "no hay nada que liberar" — mismo shape en los
+          # dos casos que la producen (ver mas abajo), solo cambia el motivo.
+          no_releasable_commits() {
+            local reason="$1"
+            echo "::warning::${reason}"
             {
               echo "### Sin release"
               echo ""
-              echo "Ningun commit del rango \`${LAST_TAG:-inicio}..HEAD\` es liberable, asi que **no se construyo ni desplego nada**."
-              echo ""
-              echo "Subjects evaluados:"
-              echo ""
-              printf '%s\n' "$SUBJECTS" | sed 's/^/- /'
+              echo "${reason}"
+              if [ -n "$SUBJECTS" ]; then
+                echo ""
+                echo "Subjects evaluados en el rango \`${LAST_TAG:-inicio}..HEAD\`:"
+                echo ""
+                printf '%s\n' "$SUBJECTS" | sed 's/^/- /'
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
             echo "bumped=false" >> $GITHUB_OUTPUT
             echo "version=" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          }
 
-          CURRENT=$(node -p "require('./package.json').version")
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "$BUMP" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          NEW="${MAJOR}.${MINOR}.${PATCH}"
-
-          # Tag-collision guard: keep bumping patch until a free slot is found.
-          git fetch --tags --force --quiet origin || true
-          while git rev-parse -q --verify "refs/tags/v${NEW}" >/dev/null 2>&1 \
-             || git ls-remote --exit-code --tags origin "refs/tags/v${NEW}" >/dev/null 2>&1; do
-            echo "Tag v${NEW} already exists — bumping patch"
-            PATCH=$((PATCH + 1))
-            NEW="${MAJOR}.${MINOR}.${PATCH}"
-          done
-
-          echo "Bumping: ${CURRENT} → ${NEW} (${BUMP})"
-
-          # Bump every package.json found (root + workspaces), shallow scan.
-          for pj in package.json */package.json; do
-            [ -f "$pj" ] || continue
-            node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('$pj','utf8'));if(p.version){p.version='$NEW';fs.writeFileSync('$pj',JSON.stringify(p,null,2)+'\n');}"
-          done
-
-          DATE=$(date +%Y-%m-%d)
-          if [ -z "$LAST_TAG" ]; then
-            RANGE_COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
-          else
-            RANGE_COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline --pretty=format:"- %s (%h)")
-          fi
-          ENTRY="## [${NEW}] - ${DATE}\n\n${RANGE_COMMITS}\n"
-          if [ -f CHANGELOG.md ]; then
-            echo -e "# Changelog\n\n${ENTRY}\n$(tail -n +2 CHANGELOG.md)" > CHANGELOG.md
-          else
-            echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
-          fi
-
-          git add -A
-          git commit -m "chore(release): v${NEW} [skip ci]"
-          git tag -a "v${NEW}" -m "Release v${NEW}"
-
-          # Push the release commit and its tag ATOMICALLY, rebasing onto
-          # anything that landed on main while this job ran.
+          # Push el commit de release y su tag ATOMICAMENTE. Si lo rechazan
+          # porque `main` se movio, NO se reintenta rebasando el MISMO commit:
+          # se descarta, se refresca `origin/main`, y se RECALCULA la version
+          # entera desde cero contra la base real.
           #
-          # The previous `git push origin HEAD:main --follow-tags` updated each
-          # ref independently: when the branch was rejected non-fast-forward
-          # (any concurrent push — a teammate, dependabot, a merge) the TAG had
-          # already been created. That left an orphan tag pointing at a commit
-          # never reachable from main, no images built, and the next run
-          # skipping that version via the collision guard above. Observed twice
-          # on kommi (v0.3.2, v0.3.3 — both deleted by hand).
+          # Por que. Dos releases que arrancan casi juntos parten del mismo
+          # `CURRENT` y terminan tocando las MISMAS lineas de version en
+          # `package.json`/`CHANGELOG.md` con contenido DISTINTO —
+          # `3.3.1→3.3.2` en uno, `3.3.1→3.3.3` en el otro. Un rebase no puede
+          # fusionar eso nunca, por diseño: son dos parches sobre la identica
+          # linea, no un conflicto que un merge de tres vias pueda resolver.
+          # La version anterior de este script reintentaba con `git rebase
+          # origin/main`, que en ESTE caso exacto siempre aborta con
+          # conflicto y tira el release entero a resolucion manual —
+          # observado en idachu, PR #103 vs #101 mergeados con ~6 minutos de
+          # diferencia (2026-08-31, run 33395817764) — aunque el commit
+          # concurrente ya hubiera liberado TODO lo que este intento iba a
+          # liberar. El guard de colision de tags de `compute_release` solo
+          # evita nombres de tag repetidos: no se entera de que el archivo
+          # que esta por commitear ya lo toco el release concurrente.
           #
-          # --atomic makes it all-or-nothing, so a rejected branch update can no
-          # longer leave a tag behind; the retry then makes the common case
-          # succeed instead of just failing cleanly.
+          # Recalcular desde `origin/main` fresco convierte el caso comun (el
+          # concurrente ya libero todo esto) en un no-op limpio —
+          # `compute_release` devuelve 1 porque el rango `LAST_TAG..HEAD` ya
+          # no tiene nada liberable — y el caso raro (el concurrente liberaba
+          # ALGO pero no todo) en un bump correcto sobre la base real, en vez
+          # de un commit corrupto o un conflicto que bloquea el pipeline.
           PUSHED=false
-          for attempt in 1 2 3; do
+          for attempt in 1 2 3 4 5; do
+            if [ "$attempt" -gt 1 ]; then
+              echo "Intento ${attempt}: descartando el commit de release anterior y recalculando contra origin/main"
+              git fetch --quiet origin main
+              git reset --hard origin/main
+              # El tag LOCAL del intento anterior sobrevive al reset (`reset
+              # --hard` solo mueve la rama y el working tree) y confundiria al
+              # guard de colision de `compute_release`, que lo veria como si
+              # ya estuviera publicado y saltearia una version de mas.
+              [ -n "${NEW:-}" ] && git tag -d "v${NEW}" >/dev/null 2>&1 || true
+            fi
+
+            if ! compute_release; then
+              if [ "$attempt" -eq 1 ]; then
+                no_releasable_commits "Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor, y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
+              else
+                no_releasable_commits "Un release concurrente ya cubrio todo lo que este intento iba a liberar: NO se construyo ni desplego nada de mas."
+              fi
+              exit 0
+            fi
+
             if git push --atomic origin HEAD:main "refs/tags/v${NEW}"; then
               PUSHED=true
               break
             fi
-            echo "Push attempt ${attempt} rejected — rebasing onto origin/main and retrying"
-            git fetch --quiet origin main
-            if ! git rebase origin/main; then
-              git rebase --abort || true
-              echo "::error::Release commit conflicts with main; resolve manually."
-              exit 1
-            fi
-            # The tag must follow the rebased commit, not the pre-rebase one.
-            git tag -f -a "v${NEW}" -m "Release v${NEW}"
-            sleep $((attempt * 3))
+            echo "Push intento ${attempt} rechazado — main avanzo mientras corria este job"
+            sleep $((attempt * 2))
           done
           if [ "$PUSHED" != "true" ]; then
-            echo "::error::Could not push release v${NEW} after 3 attempts (main kept moving)."
+            echo "::error::No se pudo publicar el release v${NEW} despues de 5 intentos (main no dejo de moverse)."
             exit 1
           fi
 
