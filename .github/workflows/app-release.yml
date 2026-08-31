@@ -478,6 +478,7 @@ jobs:
             env "${TAG_VAR}=${TAG}" ${COMPOSE} run --rm "${MIGRATOR}"
 
       - name: Deploy service
+        id: deploy
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
           host: ${{ vars.QA_PRIVATE_IP }}
@@ -496,6 +497,7 @@ jobs:
             /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
 
       - name: Restart worker (shared image)
+        id: worker
         # A worker service that reuses THIS backend's image (command override, no
         # image of its own) is NOT a deploy-matrix entry, so the per-service
         # deploy above never touches it. When the service declares
@@ -542,6 +544,7 @@ jobs:
             fi
 
       - name: Smoke test
+        id: smoke
         # Per-service smoke URL for multi-host apps: a service served on a
         # different host than smoke-base-url (e.g. a backoffice/web on its own
         # domain vs the api host) sets its own `smokeUrl`. Fall back to
@@ -561,6 +564,27 @@ jobs:
           echo "Smoke: $SMOKE_URL -> HTTP ${STATUS}"
           [ "$STATUS" = "200" ] || { echo "::error::Smoke test failed (HTTP ${STATUS})"; exit 1; }
 
+      # Sella el tag como last-good en el droplet — el ÚNICO camino que mueve
+      # /opt/skylabs/.last-good-tags (infra: spec deploy-reliability §2.2). El
+      # healthcheck interno del deploy NO promueve: entre el health verde y este
+      # punto el tag es candidato; recién con el smoke externo verde es "bueno".
+      # El rollback de deploy-service.sh restaura SIEMPRE desde last-good.
+      - name: Promote to last-good
+        if: success()
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ vars.QA_PRIVATE_IP }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          proxy_host: ${{ vars.BASTION_HOST }}
+          proxy_port: ${{ vars.BASTION_SSH_PORT }}
+          proxy_username: deploy
+          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: SERVICE_NAME,DEPLOY_ENV
+          script: |
+            set -e
+            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --promote
+
       - name: Log in to GHCR
         if: success()
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
@@ -577,8 +601,12 @@ jobs:
           docker tag ghcr.io/${IMAGE_NAME}:${TAG} ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
           docker push ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
 
+      # Solo si el servicio fue TOCADO y quedó mal: deploy, worker o smoke en
+      # rojo. Un fallo previo (migraciones, GHCR) no debe "rollbackear" un
+      # servicio que sigue corriendo la versión anterior sana — y con
+      # last-good como fuente, un rollback de más re-desplegaría un tag viejo.
       - name: Rollback on failure
-        if: failure()
+        if: failure() && (steps.deploy.outcome == 'failure' || steps.worker.outcome == 'failure' || steps.smoke.outcome == 'failure')
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
           host: ${{ vars.QA_PRIVATE_IP }}
