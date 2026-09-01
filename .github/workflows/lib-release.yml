@@ -151,6 +151,8 @@ jobs:
       - name: Repo gates (pre-build)
         if: ${{ inputs.extra-ci-steps != '' }}
         run: ${{ inputs.extra-ci-steps }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
       - name: Test (coverage)
         run: yarn test --coverage
       - name: Build
@@ -160,6 +162,8 @@ jobs:
       - name: Repo gates (post-build)
         if: ${{ inputs.extra-ci-steps-post-build != '' }}
         run: ${{ inputs.extra-ci-steps-post-build }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
   # ============================================================
   # STAGE 1 — MUTATION (Stryker incremental) — INFORMATIVE PARALLEL CHECK
