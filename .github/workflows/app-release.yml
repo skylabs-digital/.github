@@ -110,6 +110,18 @@ on:
         description: 'SSH key for the deploy user on QA/Prod droplets'
         required: false
 
+# husky must not run on the runner. Since the fleet moved hooks to
+# `postinstall` (sl-06k), `yarn install` installs them in CI too — the checkout
+# has a `.git` — and every git operation the workflow performs goes through
+# them: semantic-release's `git commit` hits pre-commit/commit-msg and its
+# `git push` runs the pre-push (a full `yarn ci`, duplicated). Measured on
+# 2026-09-02: the extra minute inside the push is exactly the window in which
+# a second merge to main lands and the push is rejected (menu-engine 16:04,
+# react-proto-kit 16:23). CI is the gate here, not the hooks. See
+# skylabs/docs/analyses/2026-09-02-revision-estabilidad-libs.md (sl-husky-en-ci).
+env:
+  HUSKY: 0
+
 jobs:
   # ============================================================
   # STAGE 1 — STATIC CHECKS
