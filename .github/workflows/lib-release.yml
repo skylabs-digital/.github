@@ -311,8 +311,36 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
       - name: Build
         run: yarn build
+      # Retry-recalculando, la misma semantica que ya tiene el bumper de
+      # app-release.yml: si `main` se movio mientras corria el release (dos
+      # merges seguidos), el push del commit de release rebota. Ese push ocurre
+      # en el paso `prepare` de @semantic-release/git, ANTES de `publish`, asi
+      # que un rebote no dejo nada publicado: se descarta el intento, se
+      # refresca origin/main, se reinstala y rebuildea (el otro merge pudo
+      # tocar deps o src) y semantic-release recalcula la version entera desde
+      # los tags contra la base real. Si `main` NO se movio, el fallo es real y
+      # no se reintenta. Medido el 2026-09-02 (menu-engine 16:04,
+      # react-proto-kit 16:23); plan en
+      # skylabs/docs/analyses/2026-09-02-plan-release-y-versionado-flota.md.
       - name: Semantic release
-        run: yarn dlx semantic-release
+        run: |
+          for attempt in 1 2 3; do
+            if yarn dlx semantic-release; then
+              exit 0
+            fi
+            git fetch --tags --force --prune --prune-tags --quiet origin main
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "::error::semantic-release fallo y main no se movio (intento ${attempt}): fallo real, no se reintenta"
+              exit 1
+            fi
+            echo "::warning::main se movio durante el release (intento ${attempt}): se descarta el intento y se recalcula contra origin/main"
+            git reset --hard --quiet origin/main
+            NODE_AUTH_TOKEN="${GHCR_TOKEN}" yarn install --immutable
+            yarn build
+          done
+          echo "::error::main siguio moviendose en tres intentos seguidos; se corta aca y el proximo push a main publica"
+          exit 1
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
