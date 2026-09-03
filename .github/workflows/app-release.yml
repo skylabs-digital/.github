@@ -95,12 +95,20 @@ on:
           JSON array of service objects. Each:
           {name, kind(backend|static|worker), dockerfile, context?(default "."),
            healthPath?, hasMigrations?(bool), smokeUrl?,
+           restartsWorkers?(array of compose service names),
            restartsWorker?(compose service name)}. Single source of truth for
           build + deploy + security docker-images (NOT static-checks, which is
           repo-wide and runs once).
-          `restartsWorker`: a compose service that reuses THIS service's image
-          (command override, no image of its own) — force-recreated with the
-          freshly-deployed tag right after this service deploys.
+          `restartsWorkers`: compose services that reuse THIS service's image
+          (command override, no image of their own) — each force-recreated with
+          the freshly-deployed tag right after this service deploys. An app can
+          run several processes off one image (an http server plus an outbox
+          dispatcher plus a cron runner, say), and every one of them has to
+          land on the new tag; refreshing only some leaves the rest silently
+          rotting on an old image.
+          `restartsWorker` is the singular alias kept for the callers written
+          before the list existed. Both are honoured, and declaring both is
+          fine — the union is recreated, each service only once.
         type: string
         required: true
       deploy-env:
@@ -494,9 +502,14 @@ jobs:
       IMAGE_NAME: ${{ github.repository_owner }}/${{ matrix.service.name }}
       TAG: v${{ needs.version.outputs.version }}
       DEPLOY_ENV: ${{ inputs.deploy-env }}
-      # Optional: a worker compose service that reuses THIS service's image
-      # (command override, no image of its own). Empty for services that don't
-      # declare it; the "Restart worker" step is gated on it.
+      # Optional: worker compose services that reuse THIS service's image
+      # (command override, no image of their own). Empty for services that
+      # don't declare them; the "Restart workers" step is gated on the union.
+      # The `&&/||` guard is deliberate over a bare `join(...)`: if `join` on an
+      # absent key did NOT yield '', the expression would break every service
+      # in the fleet that omits the key, not just the ones using it. Cheap
+      # insurance on a shared reusable.
+      RESTARTS_WORKERS: ${{ matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') || '' }}
       RESTARTS_WORKER: ${{ matrix.service.restartsWorker }}
     steps:
       - name: Apply migrations (isolated migrator)
@@ -563,18 +576,19 @@ jobs:
             docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
             /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
 
-      - name: Restart worker (shared image)
+      - name: Restart workers (shared image)
         id: worker
         # A worker service that reuses THIS backend's image (command override, no
         # image of its own) is NOT a deploy-matrix entry, so the per-service
         # deploy above never touches it. When the service declares
-        # `restartsWorker`, force-recreate that compose service with the SAME
-        # freshly-deployed tag so the worker runs the new code too. Without this
-        # the worker silently rots on a stale image while the api updates every
-        # release (observed in resuelto: month-old worker → Notification Engine
-        # "Missing variable" render failures because the worker's payload lagged
-        # the template). Runs only when `restartsWorker` is set.
-        if: ${{ matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null }}
+        # `restartsWorkers` (or the singular `restartsWorker`), force-recreate
+        # those compose services with the SAME freshly-deployed tag so they run
+        # the new code too. Without this a worker silently rots on a stale image
+        # while the api updates every release (observed in resuelto: month-old
+        # worker → Notification Engine "Missing variable" render failures
+        # because the worker's payload lagged the template).
+        # Runs only when at least one of the two keys is set.
+        if: ${{ (matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') != '') || (matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null) }}
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
           host: ${{ vars.QA_PRIVATE_IP }}
@@ -584,7 +598,7 @@ jobs:
           proxy_port: ${{ vars.BASTION_SSH_PORT }}
           proxy_username: deploy
           proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: SERVICE_NAME,TAG,DEPLOY_ENV,RESTARTS_WORKER
+          envs: SERVICE_NAME,TAG,DEPLOY_ENV,RESTARTS_WORKERS,RESTARTS_WORKER
           script: |
             set -e
             cd /opt/skylabs
@@ -594,21 +608,32 @@ jobs:
             # --env-file is REQUIRED so ${<APP>_*} interpolate in the worker's
             # compose `environment:` block (mirrors the migrator step above).
             # NO `|| true`: a failed recreate MUST fail the deploy (→ rollback),
-            # never silently leave the worker on stale code (that footgun is the
-            # whole reason this step exists).
+            # never silently leave a worker on stale code (that footgun is the
+            # whole reason this step exists). The loop keeps that property: the
+            # first failure exits non-zero under `set -e`, so a later worker
+            # recreating fine can never mask an earlier one that did not.
             COMPOSE="docker compose --env-file /opt/skylabs/.env -f compose.yml -f compose.${DEPLOY_ENV}.yml"
             APP="${SERVICE_NAME%-*}"
             TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
-            echo "== Recreating worker ${RESTARTS_WORKER} @ ${TAG} (via ${TAG_VAR}) =="
-            env "${TAG_VAR}=${TAG}" ${COMPOSE} up -d --no-deps --force-recreate "${RESTARTS_WORKER}"
-            # Observability: surface the image the worker now runs so drift is
-            # visible straight from the deploy log. Never fails the step.
-            WORKER_CID=$(${COMPOSE} ps -q "${RESTARTS_WORKER}" 2>/dev/null || true)
-            if [ -n "${WORKER_CID}" ]; then
-              echo "Worker ${RESTARTS_WORKER} now running image: $(docker inspect --format '{{.Config.Image}}' "${WORKER_CID}" 2>/dev/null || echo unknown)"
-            else
-              echo "::warning::Could not resolve container id for ${RESTARTS_WORKER} after recreate"
-            fi
+            # Union of the list and the singular alias. Unquoted on purpose:
+            # word splitting is what turns the space-joined list back into
+            # arguments, and compose service names have no spaces.
+            SEEN=""
+            for WORKER in ${RESTARTS_WORKERS:-} ${RESTARTS_WORKER:-}; do
+              # Dedupe, so declaring both keys does not recreate one twice.
+              case " ${SEEN} " in *" ${WORKER} "*) continue ;; esac
+              SEEN="${SEEN} ${WORKER}"
+              echo "== Recreating worker ${WORKER} @ ${TAG} (via ${TAG_VAR}) =="
+              env "${TAG_VAR}=${TAG}" ${COMPOSE} up -d --no-deps --force-recreate "${WORKER}"
+              # Observability: surface the image the worker now runs so drift is
+              # visible straight from the deploy log. Never fails the step.
+              WORKER_CID=$(${COMPOSE} ps -q "${WORKER}" 2>/dev/null || true)
+              if [ -n "${WORKER_CID}" ]; then
+                echo "Worker ${WORKER} now running image: $(docker inspect --format '{{.Config.Image}}' "${WORKER_CID}" 2>/dev/null || echo unknown)"
+              else
+                echo "::warning::Could not resolve container id for ${WORKER} after recreate"
+              fi
+            done
 
       - name: Smoke test
         id: smoke
