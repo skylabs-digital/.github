@@ -58,6 +58,25 @@ name: App Release (reusable)
 #
 # `secrets: inherit` passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY,
 # DEPLOY_SSH_KEY and the org-level vars through automatically.
+#
+# ----------------------------------------------------------------------------
+# CONTRACT WITH THE DOCKERFILES (release-versioning.md §4, adopted 2026-09-02):
+#
+# Every image in `services` is built with two build-args, guaranteed:
+#
+#   APP_VERSION=vX.Y.Z      the version the `version` job just computed and tagged
+#   BUILD_COMMIT=<sha>      the exact main commit being built
+#
+# A Dockerfile that wants them declares `ARG APP_VERSION` / `ARG BUILD_COMMIT`
+# and fixes them as `ENV`; one that does not declare them silently ignores them
+# (docker only warns). Runtime code reads the version in this order, never from
+# package.json in production:
+#
+#   APP_VERSION  ->  BUILD_COMMIT  ->  package.json "version"  ->  "unknown"
+#
+# The version job is the ONLY place the number is decided; the commit it writes
+# to main is a mirror for humans and local dev, not the source (see §1-§3 of
+# the standard). Canonical snippet: resuelto/backend/src/api/version.ts.
 # ============================================================================
 
 on:
