@@ -1,0 +1,39 @@
+# SONDA TEMPORAL — se borra antes de mergear.
+# Lo unico del cambio de `restartsWorkers` que no se puede verificar en local es
+# como evalua GitHub las expresiones cuando la key NO esta en el objeto del
+# matrix. Si `join()` sobre una key ausente no diera '', el reusable se romperia
+# para TODA app que no declare la key. Esto lo contesta sin desplegar nada.
+name: _probe restartsWorkers
+on:
+  push:
+    branches: [feat/restarts-workers-list]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - {name: "sin-ninguna-key", kind: "backend"}
+          - {name: "solo-singular", kind: "backend", restartsWorker: "resuelto-worker"}
+          - {name: "solo-lista", kind: "backend", restartsWorkers: ["kommi-outbox", "kommi-jobs"]}
+          - {name: "ambas-solapadas", kind: "backend", restartsWorkers: ["kommi-outbox", "kommi-jobs"], restartsWorker: "kommi-jobs"}
+          - {name: "lista-vacia", kind: "backend", restartsWorkers: []}
+    env:
+      RESTARTS_WORKERS: ${{ matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') || '' }}
+      RESTARTS_WORKER: ${{ matrix.service.restartsWorker }}
+    steps:
+      - name: Gate abierto (el step real correria)
+        if: ${{ (matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') != '') || (matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null) }}
+        run: |
+          echo "::notice::[${{ matrix.service.name }}] GATE=abierto WORKERS='${RESTARTS_WORKERS}' WORKER='${RESTARTS_WORKER}'"
+          SEEN=""
+          for W in ${RESTARTS_WORKERS:-} ${RESTARTS_WORKER:-}; do
+            case " ${SEEN} " in *" ${W} "*) continue ;; esac
+            SEEN="${SEEN} ${W}"
+            echo "  recrearia: ${W}"
+          done
+          echo "::notice::[${{ matrix.service.name }}] union=[${SEEN} ]"
+      - name: Gate cerrado (el step real se saltearia)
+        if: ${{ !((matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') != '') || (matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null)) }}
+        run: echo "::notice::[${{ matrix.service.name }}] GATE=cerrado WORKERS='${RESTARTS_WORKERS}' WORKER='${RESTARTS_WORKER}'"
