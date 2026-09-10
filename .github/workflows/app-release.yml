@@ -146,6 +146,12 @@ jobs:
   # descriptor y nada más: build, scan y deploy lo ven solos.
   # ============================================================
   matrix:
+    # Igual que `static-checks`: Dependabot no recibe secrets en sus propios
+    # `pull_request`, y este job autentica `yarn install` con GHCR_TOKEN. A
+    # diferencia de `static-checks`, SÍ corre en `schedule` — el leg de Grype
+    # en `security` necesita una lista real de servicios para el scan
+    # periódico, y en schedule el actor no es dependabot.
+    if: github.actor != 'dependabot[bot]'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     outputs:
@@ -220,11 +226,19 @@ jobs:
   security:
     name: Security (org reusable@v1)
     needs: [matrix]
+    # `matrix` is skipped on Dependabot PRs (see its `if:` above). Today's
+    # behavior is that `security` still runs OSV/Gitleaks on every event —
+    # only Grype (image-scan) is gated to push/schedule, inside the reusable.
+    # Replicate that here: run unless `matrix` actually failed/was cancelled,
+    # falling back to an empty docker-images list when it was skipped. Grype
+    # never sees that empty list anyway on a Dependabot PR, since
+    # security.yml@v1 gates it to push/schedule internally.
+    if: always() && needs.matrix.result != 'failure' && needs.matrix.result != 'cancelled'
     uses: skylabs-digital/.github/.github/workflows/security.yml@v1
     with:
       # security.yml@v1 reads only {name, context, dockerfile} per entry and
       # ignores the extra kind/health/migrator keys, so we forward it verbatim.
-      docker-images: ${{ needs.matrix.outputs.services }}
+      docker-images: ${{ needs.matrix.result == 'success' && needs.matrix.outputs.services || '[]' }}
     secrets:
       # Grype builds each image to scan it, which runs `yarn workspaces focus`
       # and pulls the private @skylabs-digital/* packages from GHCR npm. Use the
@@ -560,6 +574,9 @@ jobs:
           # Texto humano en el log del job: `sl` saca JSON por defecto fuera de
           # una TTY, y un JSON de 200 líneas no se lee en Actions.
           SL_FORMAT: text
+          # Explícito y no sólo heredado del runner: evita el prompt interactivo
+          # de confirmación en prod (`ctx.env.CI !== "true"` en deploy.ts).
+          CI: 'true'
         run: yarn sl deploy "${{ inputs.deploy-env }}" --tag "v${{ needs.version.outputs.version }}"
 
       - name: Log in to GHCR
@@ -596,6 +613,7 @@ jobs:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           SL_FORMAT: text
+          CI: 'true'
         run: yarn sl deploy "${{ inputs.deploy-env }}" rollback
 
   # ============================================================
