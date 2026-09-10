@@ -733,9 +733,11 @@ jobs:
   #        created by a person (a local apply), never by CI.
   #
   # Credentials come from the GitHub Environment named after deploy-env:
-  # vars IDACHU_URL / NOTEN_URL and secret IDACHU_CAC_KEY (an idachu PLATFORM
-  # key with idachu:cac + noten:cac). noten has no key of its own — the CLI
-  # exchanges IDACHU_CAC_KEY for a service token (service-identity.md §4).
+  # vars IDACHU_URL / NOTEN_URL / FISTO_URL (one <PREFIX>_URL per provider the
+  # stack uses; the CLI derives the name from the provider's envPrefix) and
+  # secret IDACHU_CAC_KEY (an idachu PLATFORM key with idachu:cac + noten:cac +
+  # fisto:cac). noten and fisto have no key of their own — the CLI exchanges
+  # IDACHU_CAC_KEY for a service token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
   # ============================================================
@@ -773,6 +775,7 @@ jobs:
         env:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
           NOTEN_URL: ${{ vars.NOTEN_URL }}
+          FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
           if [ -z "${IDACHU_CAC_KEY}" ]; then
@@ -817,6 +820,7 @@ jobs:
         env:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
           NOTEN_URL: ${{ vars.NOTEN_URL }}
+          FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
           if [ -z "${IDACHU_CAC_KEY}" ]; then
