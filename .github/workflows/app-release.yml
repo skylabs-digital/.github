@@ -233,7 +233,7 @@ jobs:
     # falling back to an empty docker-images list when it was skipped. Grype
     # never sees that empty list anyway on a Dependabot PR, since
     # security.yml@v1 gates it to push/schedule internally.
-    if: always() && needs.matrix.result != 'failure' && needs.matrix.result != 'cancelled'
+    if: !cancelled() && needs.matrix.result != 'failure'
     uses: skylabs-digital/.github/.github/workflows/security.yml@v1
     with:
       # security.yml@v1 reads only {name, context, dockerfile} per entry and
