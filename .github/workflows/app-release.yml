@@ -1,28 +1,40 @@
 name: App Release (reusable)
 
 # ============================================================================
-# Reusable unified release pipeline for Skylabs Digital APPS (app-multi /
-# app-single). One file, 5 stages, FULL-on-main / REDUCED-on-PR fork encoded
-# ENTIRELY inside this reusable — callers only declare `on:` triggers and pass
-# their service topology.
+# Reusable unified release pipeline for Skylabs Digital APPS. One file, 6
+# stages, FULL-on-main / REDUCED-on-PR fork encoded ENTIRELY inside this
+# reusable — callers only declare `on:` triggers; the service topology comes
+# from the app's own `deploy/skylabs.yaml` descriptor via `@skylabs-digital/cli`.
 #
-#   STAGE 1  static-checks   (every event: PR + push:main + schedule)
-#   STAGE 1  security        (org reusable security.yml@v1 — every event)
-#   STAGE 2  version         (push:main only — conventional-commit bumper)
-#   STAGE 3  build-images    (needs version, bumped==true)
-#   STAGE 4  image-scan       FOLDED INTO security.yml@v1 (Grype, push/sched only)
-#   STAGE 5  deploy           (needs version + build, bumped==true)
+#   STAGE 0  matrix           (every event: PR + push:main + schedule)
+#   STAGE 1  static-checks    (every event: PR + push:main + schedule)
+#   STAGE 1  security         (org reusable security.yml@v1 — every event)
+#   STAGE 2  version          (push:main only — conventional-commit bumper)
+#   STAGE 3  build-images     (needs version, bumped==true)
+#   STAGE 4  image-scan        FOLDED INTO security.yml@v1 (Grype, push/sched only)
+#   STAGE 5  deploy            (needs version + build, bumped==true — ONE job,
+#                               ONE `sl deploy` invocation)
 #
 # The fork point is the `version` job: `if: push && ref==main && !chore(release)`.
 # On a PR, `version` never runs, so every build-*/deploy-* job (each
 # `needs: [version]` + `if: needs.version.outputs.bumped == 'true'`) is
-# structurally unreachable. PRs therefore get exactly static-checks + security
-# (REDUCED); main push gets the whole chain (FULL).
+# structurally unreachable. PRs therefore get exactly matrix + static-checks +
+# security (REDUCED); main push gets the whole chain (FULL).
 #
 # All third-party actions are SHA-pinned here so every consumer inherits the
 # supply-chain hardening for free.
 #
 # ----------------------------------------------------------------------------
+# v2 (2026-09-10): la topología sale de `deploy/skylabs.yaml` y el deploy lo
+# hace `sl deploy`. Se fueron los inputs `services`, `variant` y
+# `smoke-base-url`, y los cinco pasos SSH. Una app que todavía no tiene
+# descriptor pinea la rama `legacy-services`:
+#
+#   uses: skylabs-digital/.github/.github/workflows/app-release.yml@legacy-services
+#
+# Requisitos del caller v2: `deploy/skylabs.yaml`, `deploy/compose.yml`,
+# `deploy/secrets/<env>.env` y `@skylabs-digital/cli` como devDependency.
+#
 # HOW A CONSUMING REPO CALLS THIS (minimal caller `.github/workflows/release.yml`):
 #
 #   name: Release
@@ -41,28 +53,17 @@ name: App Release (reusable)
 #     release:
 #       uses: skylabs-digital/.github/.github/workflows/app-release.yml@main
 #       with:
-#         variant: app-multi
 #         deploy-env: qa
-#         smoke-base-url: https://qa.myapp.ar
-#         services: |
-#           [
-#             {"name":"myapp-api","kind":"backend","dockerfile":"backend/Dockerfile","context":".","healthPath":"/api/health","hasMigrations":true},
-#             {"name":"myapp-bo","kind":"static","dockerfile":"backoffice/Dockerfile","context":".","healthPath":"/bo/"},
-#             {"name":"myapp-web","kind":"static","dockerfile":"frontend/Dockerfile","context":".","healthPath":"/"}
-#           ]
+#         node-version: "24"
 #       secrets: inherit
 #
-# `services` is the SINGLE SOURCE OF TRUTH for build, deploy AND the security
-# reusable's docker-images list. It no longer drives static-checks: that gate is
-# repo-wide and runs once, independent of how many services a repo ships.
-#
 # `secrets: inherit` passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY,
-# DEPLOY_SSH_KEY and the org-level vars through automatically.
+# DEPLOY_SSH_KEY, SOPS_AGE_KEY and the org-level vars through automatically.
 #
 # ----------------------------------------------------------------------------
 # CONTRACT WITH THE DOCKERFILES (release-versioning.md §4, adopted 2026-09-02):
 #
-# Every image in `services` is built with two build-args, guaranteed:
+# Every image built is built with two build-args, guaranteed:
 #
 #   APP_VERSION=vX.Y.Z      the version the `version` job just computed and tagged
 #   BUILD_COMMIT=<sha>      the exact main commit being built
@@ -82,50 +83,21 @@ name: App Release (reusable)
 on:
   workflow_call:
     inputs:
-      variant:
-        description: 'app-multi | app-single (informational; topology is driven by `services`)'
-        type: string
-        default: app-multi
       node-version:
-        description: 'Node version for static checks'
+        description: 'Node version'
         type: string
         default: '24'
-      services:
-        description: >-
-          JSON array of service objects. Each:
-          {name, kind(backend|static|worker), dockerfile, context?(default "."),
-           healthPath?, hasMigrations?(bool), smokeUrl?,
-           restartsWorkers?(array of compose service names),
-           restartsWorker?(compose service name)}. Single source of truth for
-          build + deploy + security docker-images (NOT static-checks, which is
-          repo-wide and runs once).
-          `restartsWorkers`: compose services that reuse THIS service's image
-          (command override, no image of their own) — each force-recreated with
-          the freshly-deployed tag right after this service deploys. An app can
-          run several processes off one image (an http server plus an outbox
-          dispatcher plus a cron runner, say), and every one of them has to
-          land on the new tag; refreshing only some leaves the rest silently
-          rotting on an old image.
-          `restartsWorker` is the singular alias kept for the callers written
-          before the list existed. Both are honoured, and declaring both is
-          fine — the union is recreated, each service only once.
-        type: string
-        required: true
       deploy-env:
-        description: 'Deploy environment (maps to QA_PRIVATE_IP etc.)'
+        description: 'qa | prod — el GitHub Environment del job de deploy'
         type: string
         default: qa
-      smoke-base-url:
-        description: 'Base URL for post-deploy smoke tests (e.g. https://qa.myapp.ar)'
-        type: string
-        default: ''
       runner-labels:
         description: 'JSON array of runner labels'
         type: string
         default: '["self-hosted","linux","x64","skylabs"]'
     secrets:
       GHCR_TOKEN:
-        description: 'Classic PAT (read:packages + write:packages) for private npm + GHCR/Droplet docker login'
+        description: 'Classic PAT (read:packages + write:packages) for private npm + GHCR docker login, and sparse checkout of skylabs-digital/infra when INFRA_READ_TOKEN is not set'
         required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'GitHub App id for semantic-release-bot-skylabs (mints git-push token)'
@@ -134,13 +106,24 @@ on:
         description: 'GitHub App private key matching SEMANTIC_RELEASE_APP_ID'
         required: false
       DEPLOY_SSH_KEY:
-        description: 'SSH key for the deploy user on QA/Prod droplets'
+        description: 'SSH key for the deploy user on QA/Prod droplets (mapped to SL_SSH_KEY for `sl deploy`)'
         required: false
       IDACHU_CAC_KEY:
         description: >-
           CaC (skylabs/docs/standards/skylabs-cac.md §7-8): idachu PLATFORM key with
           idachu:cac + noten:cac, scoped per GitHub Environment (qa/prod). Only read
           when the repo has cac/stack.ts; absent → the CaC jobs skip with a warning.
+        required: false
+      SOPS_AGE_KEY:
+        description: >-
+          Clave age de CI de la FLOTA (identidad ci-github-actions), secret de organización.
+          Descifra deploy/secrets/<env>.env de la app. Sin ella, `sl deploy` no puede escribir
+          el env de la app en el droplet.
+        required: false
+      INFRA_READ_TOKEN:
+        description: >-
+          Secret de organización, sólo lectura de skylabs-digital/infra (sparse checkout de
+          registry/ para SL_REGISTRY). Falla hacia GHCR_TOKEN si todavía no existe.
         required: false
 
 # husky must not run on the runner. Since the fleet moved hooks to
@@ -156,6 +139,36 @@ env:
   HUSKY: 0
 
 jobs:
+  # ============================================================
+  # STAGE 0 — MATRIZ
+  # La topología sale del descriptor de la app (deploy/skylabs.yaml), no de un
+  # JSON escrito a mano en el caller. Un servicio nuevo es una entrada en el
+  # descriptor y nada más: build, scan y deploy lo ven solos.
+  # ============================================================
+  matrix:
+    name: Servicios (del descriptor)
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    outputs:
+      services: ${{ steps.sl.outputs.services }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: yarn sl app services
+        id: sl
+        run: |
+          set -euo pipefail
+          SERVICES="$(yarn --silent sl app services --json | jq -c '.data.services')"
+          echo "services=${SERVICES}" >> "$GITHUB_OUTPUT"
+          echo "${SERVICES}" | jq -r '.[] | "  · \(.name) (\(.kind)) ← \(.dockerfile)"' >> "$GITHUB_STEP_SUMMARY"
+
   # ============================================================
   # STAGE 1 — STATIC CHECKS
   # `yarn ci` is the repo-wide gate: typecheck + lint + test + build across
@@ -200,18 +213,18 @@ jobs:
 
   # ============================================================
   # STAGE 1 — SECURITY (org reusable@v1) — also hosts STAGE 4 image-scan.
-  # docker-images is derived from `services` (single source). OSV + Gitleaks
-  # run on every event; Grype (image-scan) runs push/schedule only — gated
-  # inside the reusable.
+  # docker-images is derived from the descriptor matrix (job `matrix`), not
+  # from a caller input. OSV + Gitleaks run on every event; Grype (image-scan)
+  # runs push/schedule only — gated inside the reusable.
   # ============================================================
   security:
     name: Security (org reusable@v1)
+    needs: [matrix]
     uses: skylabs-digital/.github/.github/workflows/security.yml@v1
     with:
-      # `services` doubles as the Grype docker-images list. security.yml@v1
-      # reads only {name, context, dockerfile} per entry and ignores the extra
-      # kind/healthPath/hasMigrations keys, so we forward it verbatim.
-      docker-images: ${{ inputs.services }}
+      # security.yml@v1 reads only {name, context, dockerfile} per entry and
+      # ignores the extra kind/health/migrator keys, so we forward it verbatim.
+      docker-images: ${{ needs.matrix.outputs.services }}
     secrets:
       # Grype builds each image to scan it, which runs `yarn workspaces focus`
       # and pulls the private @skylabs-digital/* packages from GHCR npm. Use the
@@ -443,18 +456,19 @@ jobs:
 
   # ============================================================
   # STAGE 3 — BUILD IMAGES
-  # One matrix entry per service. Pushes vN + sha + latest to GHCR.
-  # Unreachable on PR (needs version, which never runs there).
+  # One matrix entry per service, sourced from the descriptor (job `matrix`).
+  # Pushes vN + sha + latest to GHCR. Unreachable on PR (needs version, which
+  # never runs there).
   # ============================================================
   build-images:
     name: Build image (${{ matrix.service.name }})
-    needs: [version]
+    needs: [version, matrix]
     if: needs.version.outputs.bumped == 'true'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     strategy:
       fail-fast: false
       matrix:
-        service: ${{ fromJson(inputs.services) }}
+        service: ${{ fromJson(needs.matrix.outputs.services) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -486,202 +500,67 @@ jobs:
 
   # ============================================================
   # STAGE 5 — DEPLOY
-  # One matrix entry per service. Backend services with hasMigrations run a
-  # `db:migrate:plan` dry-run, then apply via the isolated `migrator` compose
-  # service, before deploy. Smoke test + qa-stable tag + rollback on failure.
-  # Unreachable on PR. Prod is a separate, manually-approved path (not here).
+  # UN job, UNA invocación. `sl deploy` hace adentro lo que antes eran cinco
+  # pasos SSH en matriz: migraciones, deploy servicio por servicio (en el orden
+  # que dice el descriptor), workers, smoke, promote, y además el registro del
+  # borde y del monitoreo, que antes no hacía nadie. Unreachable on PR. Prod
+  # is a separate, manually-approved path (not here).
   # ============================================================
   deploy:
-    name: Deploy (${{ matrix.service.name }})
-    needs: [version, build-images]
+    name: Deploy (${{ inputs.deploy-env }})
+    needs: [version, build-images, matrix]
     if: needs.version.outputs.bumped == 'true'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     environment: ${{ inputs.deploy-env }}
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        service: ${{ fromJson(inputs.services) }}
-    env:
-      REGISTRY: ghcr.io
-      SERVICE_NAME: ${{ matrix.service.name }}
-      IMAGE_NAME: ${{ github.repository_owner }}/${{ matrix.service.name }}
-      TAG: v${{ needs.version.outputs.version }}
-      DEPLOY_ENV: ${{ inputs.deploy-env }}
-      # Optional: worker compose services that reuse THIS service's image
-      # (command override, no image of their own). Empty for services that
-      # don't declare them; the "Restart workers" step is gated on the union.
-      # The `&&/||` guard is deliberate over a bare `join(...)`: if `join` on an
-      # absent key did NOT yield '', the expression would break every service
-      # in the fleet that omits the key, not just the ones using it. Cheap
-      # insurance on a shared reusable.
-      RESTARTS_WORKERS: ${{ matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') || '' }}
-      RESTARTS_WORKER: ${{ matrix.service.restartsWorker }}
     steps:
-      - name: Apply migrations (isolated migrator)
-        # Apply committed migrations via the isolated one-shot <app>-migrator
-        # compose service, using the COMPILED migrator in the prod image
-        # (db:migrate:deploy = node dist/...). We do NOT run db:migrate:plan
-        # here: that script is tsx/drizzle-kit based and the prod runtime image
-        # excludes those by design (CVE remediation), so it is absent in the
-        # deployed container (`Command "db:migrate:plan" not found`). The
-        # migration consistency check belongs at build time (static-checks),
-        # not against the prod image. Runs only for services with hasMigrations.
-        if: ${{ matrix.service.hasMigrations }}
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          host: ${{ vars.QA_PRIVATE_IP }}
-          username: deploy
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ vars.BASTION_HOST }}
-          proxy_port: ${{ vars.BASTION_SSH_PORT }}
-          proxy_username: deploy
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: REGISTRY,IMAGE_NAME,TAG,DEPLOY_ENV,SERVICE_NAME
-          script: |
-            set -e
-            cd /opt/skylabs
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
-            docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
-            # --env-file is REQUIRED for ${<APP>_DATABASE_URL} interpolation in
-            # the compose `environment:` blocks — without it the migrator gets an
-            # empty DATABASE_URL and fails with "no such database: postgres".
-            # deploy-service.sh injects env the same way (scripts/deploy-service.sh).
-            COMPOSE="docker compose --env-file /opt/skylabs/.env -f compose.yml -f compose.${DEPLOY_ENV}.yml"
-            APP="${SERVICE_NAME%-*}"
-            MIGRATOR="${APP}-migrator"
-            # The migrator service image is pinned to ${<APP>_API_TAG:-latest}.
-            # Export the freshly-built tag so the migrator runs the NEW image
-            # (which contains db:migrate:deploy) instead of a stale :latest —
-            # otherwise: `Command "db:migrate:deploy" not found`.
-            TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
-            echo "== Applying migrations (${MIGRATOR} @ ${TAG}) =="
-            # Run the migrator service's OWN command (a compiled `node dist/...`
-            # entrypoint declared in compose). Do NOT force `yarn db:migrate:deploy`:
-            # node-only runtime images (no corepack) can't run yarn, and the base
-            # image's stale yarn collides with packageManager. node-direct is
-            # yarn-independent and matches the node-only-runtime CVE-isolation rule.
-            env "${TAG_VAR}=${TAG}" ${COMPOSE} run --rm "${MIGRATOR}"
+          ref: v${{ needs.version.outputs.version }}
 
-      - name: Deploy service
-        id: deploy
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+      # El registro de la plataforma: sparse checkout de infra, sólo registry/.
+      # Es de dónde salen el bastión, las IPs privadas y los recipients age.
+      # INFRA_READ_TOKEN (secret de organización, sólo lectura de infra) es
+      # preferido; GHCR_TOKEN es el fallback hasta que Fer lo cree.
+      - name: Checkout del registro (sparse)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          host: ${{ vars.QA_PRIVATE_IP }}
-          username: deploy
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ vars.BASTION_HOST }}
-          proxy_port: ${{ vars.BASTION_SSH_PORT }}
-          proxy_username: deploy
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: REGISTRY,IMAGE_NAME,SERVICE_NAME,TAG,DEPLOY_ENV
-          script: |
-            set -e
-            cd /opt/skylabs
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
-            docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
-            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --tag ${TAG}
+          repository: skylabs-digital/infra
+          path: .infra-registry
+          sparse-checkout: registry
+          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
 
-      - name: Restart workers (shared image)
-        id: worker
-        # A worker service that reuses THIS backend's image (command override, no
-        # image of its own) is NOT a deploy-matrix entry, so the per-service
-        # deploy above never touches it. When the service declares
-        # `restartsWorkers` (or the singular `restartsWorker`), force-recreate
-        # those compose services with the SAME freshly-deployed tag so they run
-        # the new code too. Without this a worker silently rots on a stale image
-        # while the api updates every release (observed in resuelto: month-old
-        # worker → Notification Engine "Missing variable" render failures
-        # because the worker's payload lagged the template).
-        # Runs only when at least one of the two keys is set.
-        if: ${{ (matrix.service.restartsWorkers && join(matrix.service.restartsWorkers, ' ') != '') || (matrix.service.restartsWorker != '' && matrix.service.restartsWorker != null) }}
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
-        with:
-          host: ${{ vars.QA_PRIVATE_IP }}
-          username: deploy
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ vars.BASTION_HOST }}
-          proxy_port: ${{ vars.BASTION_SSH_PORT }}
-          proxy_username: deploy
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: SERVICE_NAME,TAG,DEPLOY_ENV,RESTARTS_WORKERS,RESTARTS_WORKER
-          script: |
-            set -e
-            cd /opt/skylabs
-            # The worker's compose image is pinned to ${<APP>_API_TAG:-latest}
-            # (same var the isolated migrator uses). Export the freshly-deployed
-            # tag so `up -d --force-recreate` lands the worker on the NEW image.
-            # --env-file is REQUIRED so ${<APP>_*} interpolate in the worker's
-            # compose `environment:` block (mirrors the migrator step above).
-            # NO `|| true`: a failed recreate MUST fail the deploy (→ rollback),
-            # never silently leave a worker on stale code (that footgun is the
-            # whole reason this step exists). The loop keeps that property: the
-            # first failure exits non-zero under `set -e`, so a later worker
-            # recreating fine can never mask an earlier one that did not.
-            COMPOSE="docker compose --env-file /opt/skylabs/.env -f compose.yml -f compose.${DEPLOY_ENV}.yml"
-            APP="${SERVICE_NAME%-*}"
-            TAG_VAR="$(printf '%s' "$APP" | tr '[:lower:]-' '[:upper:]_')_API_TAG"
-            # Union of the list and the singular alias. Unquoted on purpose:
-            # word splitting is what turns the space-joined list back into
-            # arguments, and compose service names have no spaces.
-            SEEN=""
-            for WORKER in ${RESTARTS_WORKERS:-} ${RESTARTS_WORKER:-}; do
-              # Dedupe, so declaring both keys does not recreate one twice.
-              case " ${SEEN} " in *" ${WORKER} "*) continue ;; esac
-              SEEN="${SEEN} ${WORKER}"
-              echo "== Recreating worker ${WORKER} @ ${TAG} (via ${TAG_VAR}) =="
-              env "${TAG_VAR}=${TAG}" ${COMPOSE} up -d --no-deps --force-recreate "${WORKER}"
-              # Observability: surface the image the worker now runs so drift is
-              # visible straight from the deploy log. Never fails the step.
-              WORKER_CID=$(${COMPOSE} ps -q "${WORKER}" 2>/dev/null || true)
-              if [ -n "${WORKER_CID}" ]; then
-                echo "Worker ${WORKER} now running image: $(docker inspect --format '{{.Config.Image}}' "${WORKER_CID}" 2>/dev/null || echo unknown)"
-              else
-                echo "::warning::Could not resolve container id for ${WORKER} after recreate"
-              fi
-            done
-
-      - name: Smoke test
-        id: smoke
-        # Per-service smoke URL for multi-host apps: a service served on a
-        # different host than smoke-base-url (e.g. a backoffice/web on its own
-        # domain vs the api host) sets its own `smokeUrl`. Fall back to
-        # `smoke-base-url + healthPath`; skip when neither is resolvable rather
-        # than curling the wrong host (which 404s and fails the deploy).
+      - name: Install sops (pinned + checksum)
+        # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
         run: |
-          SMOKE_URL="${{ matrix.service.smokeUrl }}"
-          if [ -z "$SMOKE_URL" ] && [ -n "${{ inputs.smoke-base-url }}" ] && [ -n "${{ matrix.service.healthPath }}" ]; then
-            SMOKE_URL="${{ inputs.smoke-base-url }}${{ matrix.service.healthPath }}"
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -x "$HOME/.local/bin/sops-v3.11.0" ]; then
+            curl -sSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64"
+            echo "775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef  /tmp/sops" | sha256sum -c -
+            install -m 0755 /tmp/sops "$HOME/.local/bin/sops-v3.11.0"
           fi
-          if [ -z "$SMOKE_URL" ]; then
-            echo "No smoke URL for ${{ matrix.service.name }} — skipping smoke test"
-            exit 0
-          fi
-          sleep 12
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$SMOKE_URL")
-          echo "Smoke: $SMOKE_URL -> HTTP ${STATUS}"
-          [ "$STATUS" = "200" ] || { echo "::error::Smoke test failed (HTTP ${STATUS})"; exit 1; }
+          ln -sf "$HOME/.local/bin/sops-v3.11.0" "$HOME/.local/bin/sops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # Sella el tag como last-good en el droplet — el ÚNICO camino que mueve
-      # /opt/skylabs/.last-good-tags (infra: spec deploy-reliability §2.2). El
-      # healthcheck interno del deploy NO promueve: entre el health verde y este
-      # punto el tag es candidato; recién con el smoke externo verde es "bueno".
-      # El rollback de deploy-service.sh restaura SIEMPRE desde last-good.
-      - name: Promote to last-good
-        if: success()
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
-          host: ${{ vars.QA_PRIVATE_IP }}
-          username: deploy
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ vars.BASTION_HOST }}
-          proxy_port: ${{ vars.BASTION_SSH_PORT }}
-          proxy_username: deploy
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: SERVICE_NAME,DEPLOY_ENV
-          script: |
-            set -e
-            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --promote
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: sl deploy ${{ inputs.deploy-env }} --tag v${{ needs.version.outputs.version }}
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          # Texto humano en el log del job: `sl` saca JSON por defecto fuera de
+          # una TTY, y un JSON de 200 líneas no se lee en Actions.
+          SL_FORMAT: text
+        run: yarn sl deploy "${{ inputs.deploy-env }}" --tag "v${{ needs.version.outputs.version }}"
 
       - name: Log in to GHCR
         if: success()
@@ -692,33 +571,32 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Tag as ${{ inputs.deploy-env }}-stable
+        # Sigue siendo un paso del workflow y no de `sl`: es una operación sobre
+        # el REGISTRO de imágenes, no sobre un droplet, y el CLI no hace
+        # operaciones de registro en esta etapa (regla de entrada del estándar).
         if: success()
+        env:
+          SERVICES: ${{ needs.matrix.outputs.services }}
+          TAG: v${{ needs.version.outputs.version }}
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
-          set -e
-          docker pull ghcr.io/${IMAGE_NAME}:${TAG}
-          docker tag ghcr.io/${IMAGE_NAME}:${TAG} ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
-          docker push ghcr.io/${IMAGE_NAME}:${DEPLOY_ENV}-stable
+          set -euo pipefail
+          for NAME in $(echo "$SERVICES" | jq -r '.[].name'); do
+            IMAGE="ghcr.io/${{ github.repository_owner }}/${NAME}"
+            docker pull "${IMAGE}:${TAG}"
+            docker tag "${IMAGE}:${TAG}" "${IMAGE}:${DEPLOY_ENV}-stable"
+            docker push "${IMAGE}:${DEPLOY_ENV}-stable"
+          done
 
-      # Solo si el servicio fue TOCADO y quedó mal: deploy, worker o smoke en
-      # rojo. Un fallo previo (migraciones, GHCR) no debe "rollbackear" un
-      # servicio que sigue corriendo la versión anterior sana — y con
-      # last-good como fuente, un rollback de más re-desplegaría un tag viejo.
+      # El `Rollback on failure` NO necesita `SOPS_AGE_KEY`: `rollback` no
+      # descifra nada, sólo le pide al script que vuelva al último tag promovido.
       - name: Rollback on failure
-        if: failure() && (steps.deploy.outcome == 'failure' || steps.worker.outcome == 'failure' || steps.smoke.outcome == 'failure')
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
-        with:
-          host: ${{ vars.QA_PRIVATE_IP }}
-          username: deploy
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ vars.BASTION_HOST }}
-          proxy_port: ${{ vars.BASTION_SSH_PORT }}
-          proxy_username: deploy
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: SERVICE_NAME,DEPLOY_ENV
-          script: |
-            set -e
-            cd /opt/skylabs
-            /opt/skylabs/scripts/deploy-service.sh ${DEPLOY_ENV} ${SERVICE_NAME} --rollback
+        if: failure()
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          SL_FORMAT: text
+        run: yarn sl deploy "${{ inputs.deploy-env }}" rollback
 
   # ============================================================
   # STAGE 5 — CaC (configuration as code)
@@ -740,6 +618,11 @@ jobs:
   # IDACHU_CAC_KEY for a service token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
+  #
+  # SEGUIMIENTO (bead sl-0fl.2): cuando `sl cac` esté publicado (plan `sl cac`
+  # merged y `@skylabs-digital/cli` lo expone), cambiar las dos invocaciones de
+  # `yarn cac` por `yarn sl cac` en `cac-plan` y `cac-apply`. Hoy `cli` 1.3.0
+  # trae `sl deploy` y `sl app services`; `sl cac` todavía no.
   # ============================================================
   cac-plan:
     name: CaC plan (${{ inputs.deploy-env }})
