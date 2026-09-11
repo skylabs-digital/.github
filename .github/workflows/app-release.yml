@@ -171,7 +171,7 @@ jobs:
         id: sl
         run: |
           set -euo pipefail
-          SERVICES="$(yarn --silent sl app services --json | jq -c '.data.services')"
+          SERVICES="$(yarn sl app services --json | jq -c '.data.services')"
           echo "services=${SERVICES}" >> "$GITHUB_OUTPUT"
           echo "${SERVICES}" | jq -r '.[] | "  · \(.name) (\(.kind)) ← \(.dockerfile)"' >> "$GITHUB_STEP_SUMMARY"
 
