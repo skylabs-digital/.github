@@ -82,7 +82,30 @@ For an **app-single** repo, pass `variant: app-single` and a one-element
 | `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Runner labels |
 
 Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
-`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`).
+`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`,
+`SOPS_AGE_KEY`).
+
+#### `secrets-rotate` — el alta de un operador llega sola
+
+Cuando `skylabs-digital/infra` mergea un cambio de `platform.operators` del
+registro, su workflow `operators.yml` manda un `repository_dispatch`
+`skylabs-operators-changed` a cada app con `fragment: "app"`. Para recibirlo, el
+caller del repo de la app tiene que declararlo:
+
+```yaml
+on:
+  repository_dispatch:
+    types: [skylabs-operators-changed]
+```
+
+El job re-cifra `deploy/secrets/*.env` para la lista nueva (`yarn sl secrets
+rotate`) y commitea `chore(secrets): recipients del registro [skip ci]`. Los
+VALORES no cambian: cambia para quién están cifrados. Una app sin
+`deploy/secrets/` saltea el job con un aviso.
+
+`static-checks` y `security` NO corren en un `repository_dispatch`: una rotación
+de recipients no toca código. Un caller que no declara el trigger no cambia en
+nada — el job es inalcanzable sin el evento.
 
 ### `lib-release.yml` — Library release pipeline
 

@@ -14,6 +14,14 @@ name: App Release (reusable)
 #   STAGE 4  image-scan        FOLDED INTO security.yml@v1 (Grype, push/sched only)
 #   STAGE 5  deploy            (needs version + build, bumped==true — ONE job,
 #                               ONE `sl deploy` invocation)
+#   STAGE 6  secrets-rotate   (repository_dispatch `skylabs-operators-changed`
+#                               only — re-cifra deploy/secrets/*.env)
+#
+# `repository_dispatch` es un CAMINO APARTE, no una etapa más del release: es
+# el único evento en el que corre `secrets-rotate`, y el único en el que NO
+# corren `static-checks` ni `security` (una rotación de recipients no trae
+# código). `version` ya exige `push`, así que build/deploy/cac quedan afuera
+# solos. Un caller que no declara el trigger no nota ningún cambio.
 #
 # The fork point is the `version` job: `if: push && ref==main && !chore(release)`.
 # On a PR, `version` never runs, so every build-*/deploy-* job (each
@@ -200,7 +208,9 @@ jobs:
   # all of them at once — deliberately, with the fleet owner's call.
   # ============================================================
   static-checks:
-    if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule'
+    # `repository_dispatch`: una rotación de recipients (job `secrets-rotate`)
+    # no toca una línea de código — `yarn ci` entero no aporta nada ahí.
+    if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
     name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     steps:
@@ -233,7 +243,10 @@ jobs:
     # falling back to an empty docker-images list when it was skipped. Grype
     # never sees that empty list anyway on a Dependabot PR, since
     # security.yml@v1 gates it to push/schedule internally.
-    if: ${{ !cancelled() && needs.matrix.result != 'failure' }}
+    # `repository_dispatch`: una rotación de recipients (job `secrets-rotate`)
+    # no trae código nuevo que escanear, y la matriz de Grype es lo más caro
+    # del pipeline.
+    if: ${{ !cancelled() && needs.matrix.result != 'failure' && github.event_name != 'repository_dispatch' }}
     uses: skylabs-digital/.github/.github/workflows/security.yml@v1
     with:
       # security.yml@v1 reads only {name, context, dockerfile} per entry and
@@ -729,3 +742,129 @@ jobs:
             exit 0
           fi
           yarn cac apply --env "${{ inputs.deploy-env }}" --no-create-keys
+
+  # ============================================================
+  # STAGE 6 — SECRETS ROTATE — reacciona al alta/baja de un operador
+  #
+  # infra/.github/workflows/operators.yml manda un repository_dispatch
+  # `skylabs-operators-changed` a cada app con `fragment: "app"` cuando cambia
+  # `platform.operators` del registro (sin `client_payload`: la fuente es el
+  # registro y se relee acá). Se re-cifran los deploy/secrets/*.env de ESTA app
+  # para la lista nueva (`yarn sl secrets rotate`) y se commitea.
+  #
+  # Los VALORES no cambian: cambia para quién están cifrados. `sops updatekeys`
+  # es idempotente, así que un segundo dispatch no hace daño.
+  #
+  # El caller tiene que declarar el trigger:
+  #   on:
+  #     repository_dispatch:
+  #       types: [skylabs-operators-changed]
+  #
+  # Un caller que NO lo declare sigue funcionando igual: este job es
+  # inalcanzable sin el evento, y `static-checks`/`security`/`version` no
+  # cambiaron para ningún otro evento.
+  # ============================================================
+  secrets-rotate:
+    name: Secrets rotate (recipients del registro)
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'skylabs-operators-changed'
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    environment: ${{ inputs.deploy-env }}
+    permissions:
+      contents: write
+    steps:
+      # El GITHUB_TOKEN del reusable no puede pushear a una rama protegida ni
+      # leer `infra` (privado). El App token del job `version` sí: es el mismo
+      # que ya usa el bumper para commitear en main.
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Detect deploy/secrets
+        id: secretos
+        run: |
+          set -euo pipefail
+          if [ -d deploy/secrets ] && [ -f .sops.yaml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Esta app todavía no tiene deploy/secrets/: nada que rotar."
+          fi
+
+      # Sólo el registro: un checkout sparse de infra, no el repo entero.
+      - name: Checkout del registro de la plataforma
+        if: steps.secretos.outputs.present == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ${{ github.repository_owner }}/infra
+          ref: main
+          path: .infra
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: registry
+          sparse-checkout-cone-mode: true
+
+      - run: corepack enable
+        if: steps.secretos.outputs.present == 'true'
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        if: steps.secretos.outputs.present == 'true'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+
+      - name: Install
+        if: steps.secretos.outputs.present == 'true'
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Install sops (pinned + checksum)
+        # Mismo pin y mismo checksum que el job `deploy` y que
+        # infra/.github/workflows/provision-env.yml.
+        if: steps.secretos.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -x "$HOME/.local/bin/sops-v3.11.0" ]; then
+            curl -sSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64"
+            echo "775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef  /tmp/sops" | sha256sum -c -
+            install -m 0755 /tmp/sops "$HOME/.local/bin/sops-v3.11.0"
+          fi
+          ln -sf "$HOME/.local/bin/sops-v3.11.0" "$HOME/.local/bin/sops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # SOPS_AGE_KEY (identidad ci-github-actions, secret de organización)
+      # entra SÓLO por env y sólo acá: `sl secrets rotate` la usa para
+      # descifrar y volver a cifrar. Nada de `set -x` ni `echo` en este paso.
+      - name: yarn sl secrets rotate
+        if: steps.secretos.outputs.present == 'true'
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra/registry/apps.json
+          SL_FORMAT: text
+        run: yarn sl secrets rotate
+
+      - name: Commit si hay cambios
+        if: steps.secretos.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf .infra
+          if git diff --quiet -- .sops.yaml deploy/secrets/; then
+            echo "sin cambios de recipients"
+            exit 0
+          fi
+          git config user.name "semantic-release-bot-skylabs[bot]"
+          git config user.email "semantic-release-bot-skylabs[bot]@users.noreply.github.com"
+          git add .sops.yaml deploy/secrets/
+          # [skip ci]: esto no es un cambio de código y no tiene que disparar
+          # un release ni un deploy.
+          git commit -m "chore(secrets): recipients del registro [skip ci]"
+          git push origin HEAD:main
