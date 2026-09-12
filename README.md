@@ -82,7 +82,69 @@ For an **app-single** repo, pass `variant: app-single` and a one-element
 | `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Runner labels |
 
 Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
-`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`).
+`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`,
+`SOPS_AGE_KEY`).
+
+#### Rotación de operadores — `secrets-rotate`
+
+Cuando `skylabs-digital/infra` mergea un cambio de `platform.operators` del
+registro, su workflow `operators.yml` manda un `repository_dispatch`
+`skylabs-operators-changed` a cada app con `fragment: "app"`. El job re-cifra
+`deploy/secrets/*.env` de la app para la lista nueva (`yarn sl secrets rotate`)
+y commitea `chore(secrets): recipients del registro [skip ci]`. Los VALORES no
+cambian: cambia para quién están cifrados. Una app sin `deploy/secrets/`
+saltea el job con un aviso.
+
+##### El caller es obligatorio para toda app con `fragment: "app"`
+
+El trigger no se hereda del reusable: cada caller lo declara en su `on:`.
+
+```yaml
+on:
+  repository_dispatch:
+    types: [skylabs-operators-changed]
+```
+
+**Una app que no lo declara NO rota, y nada lo avisa.**
+`POST /repos/{owner}/{repo}/dispatches` devuelve **204 aunque ningún workflow
+escuche el evento**, así que el fanout de `operators.yml` queda en verde igual y
+el `.sops.yaml` de esa app se queda con el operador dado de baja como recipient
+por tiempo indefinido. No hay reintento ni alarma: la única verificación real es
+que aparezca el commit `chore(secrets): recipients del registro` en la app.
+
+##### El `concurrency` del caller tiene que separar la rotación del release
+
+Con un grupo solo (`release-${{ github.ref }}`), un `repository_dispatch` sobre
+la rama por defecto cae en el MISMO grupo que un push a main. GitHub guarda un
+único run *pending* por grupo, así que un segundo merge dentro de la ventana
+**cancela la rotación en silencio**: el único rastro es un run "cancelled" que
+nadie mira. Todo caller va así:
+
+```yaml
+concurrency:
+  group: release-${{ github.event_name == 'repository_dispatch' && 'secrets-rotate' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
+
+La rotación queda en su propio grupo (`release-secrets-rotate`) y nunca comparte
+cola con un release; `cancel-in-progress` sigue en `false` para los dos (sólo los
+PRs se cancelan entre sí).
+
+##### Detalles del job
+
+`matrix`, `static-checks` y `security` NO corren en un `repository_dispatch`:
+una rotación de recipients no toca código. Un caller que no declara el trigger
+no cambia en nada — el job es inalcanzable sin el evento.
+
+El job corre **sin `environment:`**, a diferencia de `deploy`: `SOPS_AGE_KEY` es
+un secret de organización, así que un Environment no cambia de dónde sale la
+llave — sólo agregaría required reviewers, y una baja de operador no puede
+quedar esperando una aprobación humana. Si el secret no está disponible, el job
+falla con un mensaje explícito en vez de morir dentro de sops.
+
+> **Rotar recipients no revoca lo que el operador ya vio.** Los blobs viejos
+> siguen en el historial de git de la app y se descifran con la clave vieja.
+> Rotar los VALORES es a mano — ver el runbook de `infra`.
 
 ### `lib-release.yml` — Library release pipeline
 
