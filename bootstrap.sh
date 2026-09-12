@@ -56,7 +56,7 @@ set -euo pipefail
 # este repo, que es lo que vuelve auditable lo que corre en las máquinas del
 # equipo. `sl` avisa solo cuando se quedó viejo contra un descriptor nuevo.
 CLI_PAQUETE="@skylabs-digital/cli"
-CLI_VERSION="1.10.0"
+CLI_VERSION="1.11.0"
 CLI_REGISTRY="https://npm.pkg.github.com"
 NODE_MAYOR_MINIMO=24
 
