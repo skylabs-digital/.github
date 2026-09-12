@@ -159,7 +159,12 @@ jobs:
     # diferencia de `static-checks`, SÍ corre en `schedule` — el leg de Grype
     # en `security` necesita una lista real de servicios para el scan
     # periódico, y en schedule el actor no es dependabot.
-    if: github.actor != 'dependabot[bot]'
+    # `repository_dispatch`: NO corre. Su único consumidor en ese evento sería
+    # `security`, que queda salteado, y como no hay `needs:` con
+    # `secrets-rotate`, un fallo suyo pintaría de rojo un run cuya rotación
+    # salió bien. Es un `yarn install` + `sl app services` por app por rotación
+    # que no consume nadie.
+    if: github.actor != 'dependabot[bot]' && github.event_name != 'repository_dispatch'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     outputs:
@@ -755,22 +760,40 @@ jobs:
   # Los VALORES no cambian: cambia para quién están cifrados. `sops updatekeys`
   # es idempotente, así que un segundo dispatch no hace daño.
   #
-  # El caller tiene que declarar el trigger:
+  # El caller tiene que declarar el trigger, y separar el `concurrency.group`
+  # del evento (si no, un merge posterior a main cancela la rotación pendiente
+  # en silencio — ver el README de este repo):
+  #
   #   on:
   #     repository_dispatch:
   #       types: [skylabs-operators-changed]
+  #   concurrency:
+  #     group: release-${{ github.event_name == 'repository_dispatch' && 'secrets-rotate' || github.ref }}
+  #     cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   #
-  # Un caller que NO lo declare sigue funcionando igual: este job es
-  # inalcanzable sin el evento, y `static-checks`/`security`/`version` no
-  # cambiaron para ningún otro evento.
+  # Es OBLIGATORIO para toda app con `fragment: "app"`: sin el trigger la app no
+  # rota y nada lo avisa — `POST /repos/{owner}/{repo}/dispatches` devuelve 204
+  # aunque ningún workflow escuche el evento.
+  #
+  # Un caller que NO lo declare sigue funcionando igual que hoy: este job es
+  # inalcanzable sin el evento, y `matrix`/`static-checks`/`security`/`version`
+  # no cambiaron para ningún otro evento.
   # ============================================================
   secrets-rotate:
     name: Secrets rotate (recipients del registro)
     if: github.event_name == 'repository_dispatch' && github.event.action == 'skylabs-operators-changed'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
-    environment: ${{ inputs.deploy-env }}
+    # SIN `environment:`, a diferencia de `deploy`. `SOPS_AGE_KEY` es secret de
+    # ORGANIZACIÓN (ver el bloque `secrets:` de arriba), así que un Environment
+    # no cambia de dónde sale la llave: sólo agrega su deployment branch policy
+    # y sus required reviewers. Una rotación de recipients no es un deploy —
+    # con `environment: prod` la BAJA de un operador quedaría esperando la
+    # aprobación de un humano, que es justo el evento que menos puede esperar.
+    # `version`, que también commitea a la rama por defecto, tampoco lo usa.
     permissions:
-      contents: write
+      # El checkout y el push van con el token del App, no con el GITHUB_TOKEN:
+      # `read` es el mínimo real.
+      contents: read
     steps:
       # El GITHUB_TOKEN del reusable no puede pushear a una rama protegida ni
       # leer `infra` (privado). El App token del job `version` sí: es el mismo
@@ -785,7 +808,12 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: main
+          # La rama por defecto del repo de la app, no `main` hardcodeado: esto
+          # es un reusable de flota. `fetch-depth: 0` porque el push reintenta
+          # con `git pull --rebase` y un clone shallow no tiene sobre qué
+          # rebasar.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Detect deploy/secrets
@@ -800,13 +828,18 @@ jobs:
           fi
 
       # Sólo el registro: un checkout sparse de infra, no el repo entero.
+      # Mismo `path: .infra-registry` que el job `deploy`, para que el nombre no
+      # dependa del job. El TOKEN sí es distinto a propósito: a `deploy` le
+      # alcanza con INFRA_READ_TOKEN (sólo lectura de infra) y acá hace falta el
+      # del App, que además es el único que puede pushear a la rama protegida de
+      # la app.
       - name: Checkout del registro de la plataforma
         if: steps.secretos.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: ${{ github.repository_owner }}/infra
           ref: main
-          path: .infra
+          path: .infra-registry
           token: ${{ steps.app-token.outputs.token }}
           sparse-checkout: registry
           sparse-checkout-cone-mode: true
@@ -848,16 +881,31 @@ jobs:
         if: steps.secretos.outputs.present == 'true'
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
-          SL_REGISTRY: ${{ github.workspace }}/.infra/registry/apps.json
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           SL_FORMAT: text
-        run: yarn sl secrets rotate
+        run: |
+          # Mismo chequeo que `cac-apply` hace con IDACHU_CAC_KEY, pero acá
+          # FALLA en vez de saltear: sin la llave no hay rotación, y una baja de
+          # operador que se saltea en silencio es un agujero abierto. Sin esta
+          # guarda el run muere igual, pero con un error de sops — el peor lugar
+          # posible para enterarse de que falta un secret.
+          if [ -z "${SOPS_AGE_KEY}" ]; then
+            echo "::error::SOPS_AGE_KEY no está disponible en este repo: la rotación de recipients no puede correr. Es un secret de organización — revisá que la org se lo comparta a este repositorio."
+            exit 1
+          fi
+          yarn sl secrets rotate
 
       - name: Commit si hay cambios
         if: steps.secretos.outputs.present == 'true'
+        env:
+          RAMA: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          rm -rf .infra
-          if git diff --quiet -- .sops.yaml deploy/secrets/; then
+          rm -rf .infra-registry
+          # `git status --porcelain` y no `git diff --quiet`: `diff` sólo ve
+          # archivos trackeados, así que un `.env` NUEVO bajo deploy/secrets/ no
+          # se detectaría.
+          if [ -z "$(git status --porcelain -- .sops.yaml deploy/secrets/)" ]; then
             echo "sin cambios de recipients"
             exit 0
           fi
@@ -867,4 +915,31 @@ jobs:
           # [skip ci]: esto no es un cambio de código y no tiene que disparar
           # un release ni un deploy.
           git commit -m "chore(secrets): recipients del registro [skip ci]"
-          git push origin HEAD:main
+
+          # Mismo patrón que el job `version`: 5 intentos, porque la rama por
+          # defecto puede avanzar entre el checkout y el push. A diferencia del
+          # bumper, acá el reintento SÍ puede rebasar: el commit toca
+          # `.sops.yaml` y `deploy/secrets/`, que ningún otro job escribe, así
+          # que no hay dos escrituras compitiendo por la misma línea. Si aun así
+          # el rebase choca, se corta en rojo con la instrucción exacta: volver
+          # a mandar el dispatch, que `sops updatekeys` es idempotente.
+          PUSHED=false
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${RAMA}"; then
+              PUSHED=true
+              break
+            fi
+            echo "Push intento ${attempt} rechazado — ${RAMA} avanzó mientras corría este job"
+            if [ "$attempt" -lt 5 ]; then
+              if ! git pull --rebase origin "${RAMA}"; then
+                git rebase --abort || true
+                echo "::error::El rebase sobre ${RAMA} falló: otro commit tocó los mismos secretos. Volvé a mandar el repository_dispatch skylabs-operators-changed para recalcular la rotación desde cero."
+                exit 1
+              fi
+              sleep $((attempt * 2))
+            fi
+          done
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::No se pudieron publicar los recipients nuevos después de 5 intentos (${RAMA} no dejó de moverse). Volvé a mandar el repository_dispatch skylabs-operators-changed: la rotación es idempotente."
+            exit 1
+          fi
