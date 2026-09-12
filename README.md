@@ -2,6 +2,70 @@
 
 Org-wide defaults and reusable workflows for Skylabs Digital.
 
+## Bootstrap de una máquina nueva (`bootstrap.sh`)
+
+Una línea para tener `sl`, el CLI de la flota. Se corre **una vez por máquina**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skylabs-digital/.github/main/bootstrap.sh | bash
+```
+
+**Leelo antes de correrlo** — para eso está acá, en el único repo público de la org:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skylabs-digital/.github/main/bootstrap.sh | less
+```
+
+El script, en orden, y **cada paso es idempotente** (volver a correrlo no reinstala nada):
+
+1. Verifica `brew`, `node` (>= 24), `gh`, `sops` y `age`. Lo que falte, lo dice y **pregunta**
+   antes de instalarlo con brew. Homebrew no lo instala él: su instalador te pide agregar una
+   línea a tu profile, y este script no toca profiles.
+2. `corepack enable` — es lo que da `yarn`; los repos lo declaran en `packageManager`.
+3. `gh auth status`. Sin sesión, `gh auth login`. Con sesión pero sin el scope **`read:packages`**,
+   `gh auth refresh -s read:packages`. **Ese es el paso que hoy nadie sabe que existe**: el token
+   que deja `gh auth login` no lo trae, y sin él instalar desde GitHub Packages devuelve 403.
+4. `npm install -g @skylabs-digital/cli@<versión pineada>`, con el token que `gh auth token`
+   resuelve en tu máquina, en el momento.
+5. `sl auth init`: genera tus identidades (age + SSH), abre el PR de alta contra `infra` y espera
+   el merge para avisarte cuando ya podés descifrar.
+
+### Qué pasa después
+
+El PR de alta lo tiene que mergear alguien, y CI re-cifra los secretos con tu clave. **Hasta que
+eso pasa, tu clave nueva no descifra nada** — no es un trámite que se pueda saltear: si se
+pudiera, cualquiera que corriera `sl auth init` leería los secretos de la flota.
+
+Con el alta mergeada, cada repo se alista **con un comando**, y sin exportar ninguna variable:
+
+```bash
+git clone git@github.com:skylabs-digital/<repo>.git
+cd <repo> && sl setup     # yarn install + tu .env local + qué falta
+```
+
+Si algo no cierra: `sl doctor`.
+
+### Las reglas que hacen aceptable un `curl | bash`
+
+Un `| bash` es código que se ejecuta sin haberse leído, y este repo pasa a ser un lugar desde
+donde se corre código en las máquinas de todo el equipo. Se sostiene con estas condiciones, y
+cualquier PR que toque `bootstrap.sh` las tiene que respetar:
+
+| Condición | Por qué |
+|---|---|
+| `main` protegida (PR + non-fast-forward + no borrado) | Sin eso, esta línea no debería publicarse |
+| **Legible sin ejecutarlo** — el encabezado dice qué hace, qué instala y qué NO hace | `curl <url>` a secas tiene que alcanzar para revisarlo |
+| **CLI pineado a una versión**, nunca `latest` | Un `curl \| bash` que instala "lo último" es un canal de despliegue automático hacia las laptops del equipo |
+| **Ningún secreto adentro** | El token sale de `gh auth token` en la máquina, en el momento; no se escribe en ningún archivo ni se imprime |
+| **No toca ningún profile** (`.zshrc`, `.bash_profile`, nada) | Si hiciera falta exportar algo, el diseño del CLI habría fallado: `sl` le inyecta las credenciales a los procesos que lanza |
+| Nada se instala sin preguntar, y nada corre con `sudo` | Default **no**: el script imprime el comando exacto antes de correrlo |
+
+Subir la versión pineada del CLI es un PR a este repo — que es justamente lo que vuelve auditable
+lo que corre en las máquinas del equipo.
+
+Diseño completo: `docs/superpowers/specs/2026-09-12-bootstrap-maquina-nueva-design.md` en el
+wrapper de la flota.
+
 ## Reusable workflows
 
 ### `security.yml` — Security Scan

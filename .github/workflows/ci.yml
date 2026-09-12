@@ -10,6 +10,7 @@ on:
     paths:
       - '.github/workflows/**'
       - 'scripts/**'
+      - 'bootstrap.sh'
 
 permissions:
   contents: read
@@ -56,8 +57,14 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      - name: shellcheck de scripts/
+      # bootstrap.sh se sirve por raw.githubusercontent y se corre con `curl | bash`
+      # en las máquinas del equipo: es el shell de este repo que más caro sale
+      # romper, así que entra al mismo gate que scripts/.
+      - name: shellcheck de scripts/ y bootstrap.sh
         run: |
-          if ls scripts/*.sh >/dev/null 2>&1; then
-            docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:v0.11.0 scripts/*.sh
+          archivos=()
+          ls scripts/*.sh >/dev/null 2>&1 && archivos+=(scripts/*.sh)
+          [ -f bootstrap.sh ] && archivos+=(bootstrap.sh)
+          if [ ${#archivos[@]} -gt 0 ]; then
+            docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:v0.11.0 "${archivos[@]}"
           fi
