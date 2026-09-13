@@ -103,6 +103,28 @@ on:
         description: 'JSON array of runner labels'
         type: string
         default: '["self-hosted","linux","x64","skylabs"]'
+      deploy:
+        description: >
+          false → el pipeline hace TODO menos desplegar: CI, versión, imagen,
+          seguridad y CaC. Para un servicio que no se despliega con `sl deploy`
+          porque su host no sale de `stacks.<env>.<stack>` — hoy `docs`, que
+          corre en el droplet de monitor y se despliega con un job propio que
+          llama a `deploy-service.sh monitor`, igual que el deploy-dashboard.
+          El default es `true`: nadie que no pase este input cambia de
+          comportamiento.
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: >
+          La versión que publicó esta corrida, sin la `v` (`0.3.1`). Vacía si
+          no hubo bump. La necesita quien se despliega por su cuenta
+          (`deploy: false`): la imagen se construye del commit del bump, así
+          que el `github.sha` del caller NO es el de la imagen.
+        value: ${{ jobs.version.outputs.version }}
+      bumped:
+        description: '`true` si esta corrida publicó una versión nueva.'
+        value: ${{ jobs.version.outputs.bumped }}
     secrets:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages + write:packages) for private npm + GHCR docker login, and sparse checkout of skylabs-digital/infra when INFRA_READ_TOKEN is not set'
@@ -541,7 +563,7 @@ jobs:
   deploy:
     name: Deploy (${{ inputs.deploy-env }})
     needs: [version, build-images, matrix]
-    if: needs.version.outputs.bumped == 'true'
+    if: needs.version.outputs.bumped == 'true' && inputs.deploy
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     environment: ${{ inputs.deploy-env }}
     steps:
@@ -706,7 +728,10 @@ jobs:
   cac-apply:
     name: CaC apply (${{ inputs.deploy-env }})
     needs: [version, deploy]
-    if: needs.version.outputs.bumped == 'true'
+    # `skipped` es el caso de `deploy: false`: no hubo deploy que esperar, pero
+    # la identidad de la app en las plataformas se aplica igual. Un deploy que
+    # FALLÓ no entra — ahí lo último que se quiere es mover la configuración.
+    if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     environment: ${{ inputs.deploy-env }}
     steps:

@@ -3,3 +3,6 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Worktrees de agentes: adentro hay OTRO checkout, no parte de este repo.
+.worktrees/
