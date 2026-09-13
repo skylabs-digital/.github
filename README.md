@@ -1,623 +1,92 @@
-# skylabs-digital/.github
+# 🔁 skylabs-digital/.github
 
-Org-wide defaults and reusable workflows for Skylabs Digital.
+> The reusable release, security and docs pipelines every repo calls.
 
-## Bootstrap de una máquina nueva (`bootstrap.sh`)
+| | |
+|---|---|
+| 🧱 **Repo type** | Org reusable workflows and the new-machine bootstrap (public) |
+| 🏷️ **Version** | Consumed at `@main` (release, docs) and `@v1` (`security.yml`) |
+| 🚦 **Status** | 🟢 Stable — every app and library in the org releases through it |
+| 📚 **Docs** | [docs.skylabs.digital/workflows](https://docs.skylabs.digital/workflows/) |
 
-Una línea para tener `sl`, el CLI de la flota. Se corre **una vez por máquina**:
+## ✨ What it does
+
+Each Skylabs repo has a thin `.github/workflows/release.yml` that declares its triggers and
+permissions and hands the pipeline to one of these reusables:
+
+| Workflow | For | Stages |
+|---|---|---|
+| `app-release.yml` | apps | static checks · security · version bump · image build · `sl deploy` · config as code · secret rotation |
+| `lib-release.yml` | libraries | CI · mutation (informative) · security · semantic-release to GitHub Packages |
+| `security.yml` | everyone (called by the two above) | OSV-Scanner · Gitleaks · Grype · weekly rolling issue |
+| `docs-publish.yml` | every repo with `docs/public/` | announce the section (`sl cac apply`) · publish the pages (`sl docs sync`), with its own pinned `sl` and the job's OIDC token |
+
+The **FULL / REDUCED** fork lives inside each reusable: pull requests get checks and security;
+a push to `main` also versions, publishes or builds, and deploys. Third-party actions are
+SHA-pinned here, so every caller inherits the hardening.
+
+Two traps worth knowing before you touch a reusable:
+
+- **A reusable job that requests a permission its caller did not grant makes the whole run fail
+  at startup**, on every event. Reusables declare no `permissions:` of their own and only ever
+  reduce at job level.
+- **An app caller must declare `repository_dispatch: skylabs-operators-changed`** and split its
+  `concurrency.group` for that event, or it never re-encrypts its secrets when an operator
+  leaves — and nothing warns you.
+
+## 🚀 Quick start
+
+A new machine, once:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/skylabs-digital/.github/main/bootstrap.sh | bash
 ```
 
-**Leelo antes de correrlo** — para eso está acá, en el único repo público de la org:
+Read it first (`… | less`): it checks brew, node, gh, sops and age and asks before installing
+anything, adds the `read:packages` scope to your `gh` token, installs a **pinned** version of the
+`sl` CLI, and runs `sl auth init`. It writes no secret and touches no shell profile.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/skylabs-digital/.github/main/bootstrap.sh | less
-```
-
-El script, en orden, y **cada paso es idempotente** (volver a correrlo no reinstala nada):
-
-1. Verifica `brew`, `node` (>= 24), `gh`, `sops` y `age`. Lo que falte, lo dice y **pregunta**
-   antes de instalarlo con brew. Homebrew no lo instala él: su instalador te pide agregar una
-   línea a tu profile, y este script no toca profiles.
-2. `corepack enable` — es lo que da `yarn`; los repos lo declaran en `packageManager`.
-3. `gh auth status`. Sin sesión, `gh auth login`. Con sesión pero sin el scope **`read:packages`**,
-   `gh auth refresh -s read:packages`. **Ese es el paso que hoy nadie sabe que existe**: el token
-   que deja `gh auth login` no lo trae, y sin él instalar desde GitHub Packages devuelve 403.
-4. `npm install -g @skylabs-digital/cli@<versión pineada>`, con el token que `gh auth token`
-   resuelve en tu máquina, en el momento.
-5. `sl auth init`: genera tus identidades (age + SSH), abre el PR de alta contra `infra` y espera
-   el merge para avisarte cuando ya podés descifrar.
-
-### Qué pasa después
-
-El PR de alta lo tiene que mergear alguien, y CI re-cifra los secretos con tu clave. **Hasta que
-eso pasa, tu clave nueva no descifra nada** — no es un trámite que se pueda saltear: si se
-pudiera, cualquiera que corriera `sl auth init` leería los secretos de la flota.
-
-Con el alta mergeada, cada repo se alista **con un comando**, y sin exportar ninguna variable:
-
-```bash
-git clone git@github.com:skylabs-digital/<repo>.git
-cd <repo> && sl setup     # yarn install + tu .env local + qué falta
-```
-
-Si algo no cierra: `sl doctor`.
-
-### Las reglas que hacen aceptable un `curl | bash`
-
-Un `| bash` es código que se ejecuta sin haberse leído, y este repo pasa a ser un lugar desde
-donde se corre código en las máquinas de todo el equipo. Se sostiene con estas condiciones, y
-cualquier PR que toque `bootstrap.sh` las tiene que respetar:
-
-| Condición | Por qué |
-|---|---|
-| `main` protegida (PR + non-fast-forward + no borrado) | Sin eso, esta línea no debería publicarse |
-| **Legible sin ejecutarlo** — el encabezado dice qué hace, qué instala y qué NO hace | `curl <url>` a secas tiene que alcanzar para revisarlo |
-| **CLI pineado a una versión**, nunca `latest` | Un `curl \| bash` que instala "lo último" es un canal de despliegue automático hacia las laptops del equipo |
-| **Ningún secreto adentro** | El token sale de `gh auth token` en la máquina, en el momento; no se escribe en ningún archivo ni se imprime |
-| **No toca ningún profile** (`.zshrc`, `.bash_profile`, nada) | Si hiciera falta exportar algo, el diseño del CLI habría fallado: `sl` le inyecta las credenciales a los procesos que lanza |
-| Nada se instala sin preguntar, y nada corre con `sudo` | Default **no**: el script imprime el comando exacto antes de correrlo |
-
-Subir la versión pineada del CLI es un PR a este repo — que es justamente lo que vuelve auditable
-lo que corre en las máquinas del equipo.
-
-Diseño completo: `docs/superpowers/specs/2026-09-12-bootstrap-maquina-nueva-design.md` en el
-wrapper de la flota.
-
-## Reusable workflows
-
-### `security.yml` — Security Scan
-
-Standardized security scanning: dependency vulnerabilities (OSV), secrets in git history (Gitleaks), and container image vulnerabilities (Grype).
-
-**Design choices for minimal noise:**
-- `docker-scan` runs **only** on `push:main` and the weekly `schedule` — never on PRs. PR coverage comes from `osv-scan` over lockfiles.
-- No `permissions:` block in the reusable — permissions inherit from the caller, avoiding cross-repo escalation and startup failures.
-- `osv-scan` and `secrets-scan` are fast (<30 s combined); safe to run on every matching PR.
-- **`osv-scan` and `docker-scan` are fixability-gated**: both run non-blocking with JSON output, then **fail only on FIXABLE findings ≥ the severity threshold** (`osv-fail-on-severity` / `grype-fail-on-severity`, default `high`). Vulns with no upstream patch yet, or below the threshold, are reported as warnings + a job summary, never blocking. See `docs/standards/cicd-security-reusable.md`.
-- **`secrets-scan` (Gitleaks)** keeps `exit-code 1` on real secrets (a leak stays a leak) but honours a caller `.gitleaks.toml` allowlist and `.gitleaksignore` fingerprints, so confirmed false positives can be suppressed without weakening detection.
-
-### `app-release.yml` — App release pipeline (app-multi / app-single)
-
-The full 5-stage unified release pipeline for **apps**, extracted to an org
-reusable. The FULL-on-`main` / REDUCED-on-PR fork lives **inside** the
-reusable — callers only declare `on:` triggers and pass their service
-topology. See [Unified Release Pipeline](#unified-release-pipeline-releaseyml)
-below for the stage model.
-
-- **REDUCED** (PR / non-main): `static-checks` + `security` only. The `version`
-  job is `if: push && ref==main && !chore(release)`, so every `build`/`deploy`
-  job (`needs: [version]` + `if: bumped == 'true'`) is structurally unreachable
-  on PRs.
-- **FULL** (push to `main`): static-checks → security → version → build-images
-  → image-scan (folded into `security`) → deploy QA + smoke + `qa-stable` tag,
-  rollback on failure.
-- `services` is the **single source of truth**: it drives the static-checks
-  matrix, the build matrix, the deploy matrix, *and* the `security` reusable's
-  `docker-images` list.
-- Backend services with `"hasMigrations": true` run a `db:migrate:plan`
-  dry-run before applying via the isolated `migrator` compose service
-  (db-migrate-cicd.md rule #1).
-- All third-party actions are SHA-pinned in the reusable; consumers inherit the
-  hardening for free.
-
-**Minimal caller** (`.github/workflows/release.yml`):
+A library's caller:
 
 ```yaml
-name: Release
-on:
-  pull_request: { branches: [main] }
-  push: { branches: [main] }
-  schedule: [{ cron: '0 6 * * 1' }]
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-jobs:
-  release:
-    uses: skylabs-digital/.github/.github/workflows/app-release.yml@main
-    with:
-      variant: app-multi          # app-multi | app-single (informational)
-      deploy-env: qa
-      smoke-base-url: https://qa.myapp.ar
-      services: |
-        [
-          {"name":"myapp-api","kind":"backend","dockerfile":"backend/Dockerfile","context":".","healthPath":"/api/health","hasMigrations":true},
-          {"name":"myapp-bo","kind":"static","dockerfile":"backoffice/Dockerfile","context":".","healthPath":"/bo/"},
-          {"name":"myapp-web","kind":"static","dockerfile":"frontend/Dockerfile","context":".","healthPath":"/"}
-        ]
-    secrets: inherit
-```
-
-For an **app-single** repo, pass `variant: app-single` and a one-element
-`services` array.
-
-#### `app-release.yml` inputs
-
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `variant` | string | `app-multi` | `app-multi` \| `app-single` (informational; topology comes from `services`) |
-| `node-version` | string | `24` | Node version for static checks |
-| `services` | string (JSON) | **required** | Array of `{name, kind, dockerfile, context?, healthPath?, hasMigrations?}` — single source of truth |
-| `deploy-env` | string | `qa` | Deploy environment (maps to `QA_PRIVATE_IP` etc.) |
-| `smoke-base-url` | string | `''` | Base URL for post-deploy smoke tests |
-| `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Runner labels |
-
-Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
-`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`, `DEPLOY_SSH_KEY`,
-`SOPS_AGE_KEY`).
-
-#### Rotación de operadores — `secrets-rotate`
-
-Cuando `skylabs-digital/infra` mergea un cambio de `platform.operators` del
-registro, su workflow `operators.yml` manda un `repository_dispatch`
-`skylabs-operators-changed` a cada app con `fragment: "app"`. El job re-cifra
-`deploy/secrets/*.env` de la app para la lista nueva (`yarn sl secrets rotate`)
-y commitea `chore(secrets): recipients del registro [skip ci]`. Los VALORES no
-cambian: cambia para quién están cifrados. Una app sin `deploy/secrets/`
-saltea el job con un aviso.
-
-##### El caller es obligatorio para toda app con `fragment: "app"`
-
-El trigger no se hereda del reusable: cada caller lo declara en su `on:`.
-
-```yaml
-on:
-  repository_dispatch:
-    types: [skylabs-operators-changed]
-```
-
-**Una app que no lo declara NO rota, y nada lo avisa.**
-`POST /repos/{owner}/{repo}/dispatches` devuelve **204 aunque ningún workflow
-escuche el evento**, así que el fanout de `operators.yml` queda en verde igual y
-el `.sops.yaml` de esa app se queda con el operador dado de baja como recipient
-por tiempo indefinido. No hay reintento ni alarma: la única verificación real es
-que aparezca el commit `chore(secrets): recipients del registro` en la app.
-
-##### El `concurrency` del caller tiene que separar la rotación del release
-
-Con un grupo solo (`release-${{ github.ref }}`), un `repository_dispatch` sobre
-la rama por defecto cae en el MISMO grupo que un push a main. GitHub guarda un
-único run *pending* por grupo, así que un segundo merge dentro de la ventana
-**cancela la rotación en silencio**: el único rastro es un run "cancelled" que
-nadie mira. Todo caller va así:
-
-```yaml
-concurrency:
-  group: release-${{ github.event_name == 'repository_dispatch' && 'secrets-rotate' || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-```
-
-La rotación queda en su propio grupo (`release-secrets-rotate`) y nunca comparte
-cola con un release; `cancel-in-progress` sigue en `false` para los dos (sólo los
-PRs se cancelan entre sí).
-
-##### Detalles del job
-
-`matrix`, `static-checks` y `security` NO corren en un `repository_dispatch`:
-una rotación de recipients no toca código. Un caller que no declara el trigger
-no cambia en nada — el job es inalcanzable sin el evento.
-
-El job corre **sin `environment:`**, a diferencia de `deploy`: `SOPS_AGE_KEY` es
-un secret de organización, así que un Environment no cambia de dónde sale la
-llave — sólo agregaría required reviewers, y una baja de operador no puede
-quedar esperando una aprobación humana. Si el secret no está disponible, el job
-falla con un mensaje explícito en vez de morir dentro de sops.
-
-> **Rotar recipients no revoca lo que el operador ya vio.** Los blobs viejos
-> siguen en el historial de git de la app y se descifran con la clave vieja.
-> Rotar los VALORES es a mano — ver el runbook de `infra`.
-
-### `lib-release.yml` — Library release pipeline
-
-The unified release pipeline for **npm libraries**: `ci → security →
-semantic-release`, fork-encoded inside the reusable.
-
-- **REDUCED** (PR / non-main): `ci` (typecheck + lint + test/coverage + build)
-  + `mutation` (Stryker incremental) + `security`. The `release` job is
-  `if: push && ref==main`, so PRs never publish.
-- **FULL** (push to `main`): the above plus `semantic-release` (version + npm
-  publish to GitHub Packages).
-- `run-mutation: true` (default) wires **Stryker incremental as a required
-  parallel check** — closing the ecosystem-wide "Stryker configured locally
-  but absent from CI" gap without each lib hand-rolling a `stryker-pr.yml`.
-
-**Minimal caller** (`.github/workflows/release.yml`):
-
-```yaml
-name: Release
-on:
-  pull_request: { branches: [main] }
-  push: { branches: [main] }
-  schedule: [{ cron: '0 6 * * 1' }]
-permissions:
-  contents: write
-  packages: write
-  id-token: write
 jobs:
   release:
     uses: skylabs-digital/.github/.github/workflows/lib-release.yml@main
     with:
-      node-version: '24'
-      build-tool: tsup        # tsc | tsup | vite
+      node-version: "24"
       run-mutation: true
-      coverage-floor: 90
     secrets: inherit
 ```
 
-The lib must define `yarn typecheck`, `yarn lint`, `yarn test`, `yarn build`,
-a `mutation` script (or have Stryker installed for `stryker run`), and a
-`release.config.*` for semantic-release.
-
-#### `lib-release.yml` inputs
-
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `node-version` | string | `24` | Node version |
-| `build-tool` | string | `tsc` | `tsc` \| `tsup` \| `vite` (informational; `yarn build` is invoked) |
-| `run-mutation` | boolean | `true` | Run Stryker incremental as a required parallel check |
-| `coverage-floor` | number | `90` | Coverage floor (forwarded as `COVERAGE_FLOOR`; enforced by the lib vitest config) |
-
-Secrets are passed with `secrets: inherit` (`GHCR_TOKEN`,
-`SEMANTIC_RELEASE_APP_ID`, `SEMANTIC_RELEASE_PRIVATE_KEY`).
-
----
-
-## Caller templates
-
-### Template 1 — Node app + Docker (deployed services)
-
-For: `resuelto`, `noten`, `idachu`, `skylabs-mcp`, `kommi`
+An app's caller:
 
 ```yaml
-# .github/workflows/security.yml
-name: Security
-on:
-  push: { branches: [main] }
-  pull_request:
-    paths:
-      - '**/package.json'
-      - '**/yarn.lock'
-      - '**/package-lock.json'
-      - '**/Dockerfile*'
-      - '.github/workflows/**'
-  schedule: [{ cron: '0 6 * * 1' }]
-
-concurrency:
-  group: security-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-permissions:
-  contents: read
-
 jobs:
-  security:
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+  release:
+    uses: skylabs-digital/.github/.github/workflows/app-release.yml@main
     with:
-      docker-images: |
-        [
-          {"name":"myapp-api","context":".","dockerfile":"backend/Dockerfile"}
-        ]
-    secrets:
-      # Only needed if Dockerfiles use --mount=type=secret,id=npm_token
-      # (for private @skylabs-digital packages from GHCR npm registry)
-      npm-token: ${{ secrets.GHCR_TOKEN }}
+      deploy-env: qa
+      node-version: "24"
+    secrets: inherit
 ```
 
-### Template 2 — Node library / frontend (no Docker)
-
-For: `react-identity-access`, `analytics`, `react-proto-kit`, `menu-engine`, `appoint-mvp`, `appoint`, `plato`, `cashier`, `fisto`, `wedding-app-fe`
-
-```yaml
-name: Security
-on:
-  push: { branches: [main] }
-  pull_request:
-    paths:
-      - '**/package.json'
-      - '**/yarn.lock'
-      - '**/package-lock.json'
-      - '.github/workflows/**'
-  schedule: [{ cron: '0 6 * * 1' }]
-
-concurrency:
-  group: security-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-permissions:
-  contents: read
-
-jobs:
-  security:
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
-```
-
-### Template 3 — Infra / config (gitleaks only)
-
-For: `infra` (Terraform/config repos with no package.json)
-
-```yaml
-name: Security
-on:
-  push: { branches: [main] }
-  pull_request:
-  schedule: [{ cron: '0 6 * * 1' }]
-
-concurrency:
-  group: security-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-permissions:
-  contents: read
-
-jobs:
-  security:
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
-    with:
-      gitleaks-only: true
-```
-
----
-
-## Inputs
-
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `docker-images` | string (JSON) | `'[]'` | Array of `{name, context, dockerfile}` for Grype scan |
-| `gitleaks-only` | boolean | `false` | Skip OSV-Scanner (non-Node repos) |
-| `osv-scan-args` | string | `--recursive ./` | Override OSV-Scanner scan targets |
-| `osv-fail-on-severity` | string | `high` | Min severity (`critical\|high\|medium\|low`) at which a **fixable** OSV finding blocks the pipeline. No-fix-yet / below-threshold → warning only. |
-| `grype-fail-on-severity` | string | `high` | Same, for container-image findings. Unfixed CVEs / below-threshold → warning only. |
-
-## Secrets
-
-| Name | Required | Description |
-|---|---|---|
-| `npm-token` | no | Injected as `--mount=type=secret,id=npm_token` into Docker builds. Needed for private `@skylabs-digital` npm packages. |
-
-## Tools & versions
-
-- **OSV-Scanner** v2.3.5 — dependency vulnerabilities (npm, Docker lockfiles, etc.)
-- **Gitleaks** v8.30.1 — secrets in code + git history (arch-aware install)
-- **Grype** v0.111.1 — container image vulnerabilities, honors `.grype.yaml` in caller
-
-## Versioning
-
-- Pin to `@v1` for stability
-- Breaking changes → `@v2`
-
----
-
-# Dependabot template
-
-`dependabot.yml` cannot be inherited from this org `.github` repo (GitHub limitation: only issue/PR templates and a few other files inherit). The canonical templates below are the source of truth; apply them with `scripts/sync-dependabot.sh` (one-shot, see below).
-
-## Behaviour summary
-
-- **Routine version updates** (weekly): only `patch` and `minor` for npm and docker. No major bumps.
-- **Security updates**: GitHub Dependabot opens separate PRs labeled `security` when a CVE matches your lockfile. These bypass the `dependabot.yml` `ignore` rules and propose the minimum patched version (which can be a major if no patch/minor fix exists). Requires `vulnerability-alerts` and `automated-security-fixes` enabled at the repo level.
-
-## Template T1 — Node + Docker monorepo
-
-For repos with one or more Dockerfiles and yarn workspaces (e.g. `resuelto`, `noten`, `idachu`, `kommi`, `skylabs-mcp`).
-
-```yaml
-version: 2
-updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule: { interval: weekly }
-    groups:
-      actions:
-        patterns: ["*"]
-
-  # One docker block per Dockerfile dir. Major bumps blocked here; security
-  # advisories from GitHub still bypass these rules and may bump majors.
-  - package-ecosystem: docker
-    directory: /backend
-    schedule: { interval: weekly }
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-    groups:
-      docker:
-        patterns: ["*"]
-
-  # ... repeat the docker block for each Dockerfile dir (frontend/, backoffice/, etc.)
-
-  # One npm block per workspace dir. update-types restricted to patch+minor.
-  - package-ecosystem: npm
-    directory: /
-    schedule: { interval: weekly }
-    open-pull-requests-limit: 5
-    groups:
-      dev-deps:
-        dependency-type: development
-        update-types: [patch, minor]
-      prod-deps:
-        dependency-type: production
-        update-types: [patch, minor]
-
-  # ... repeat the npm block for each workspace (backend/, frontend/, backoffice/)
-```
-
-## Template T2 — Single-package Node lib / FE
-
-For libs and single-package apps (e.g. `analytics`, `react-identity-access`, `react-proto-kit`, `menu-engine`, `appoint-mvp`, `appoint`, `plato`, `cashier`, `fisto`, `wedding-app-fe`).
-
-```yaml
-version: 2
-updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule: { interval: weekly }
-    groups:
-      actions:
-        patterns: ["*"]
-
-  - package-ecosystem: npm
-    directory: /
-    schedule: { interval: weekly }
-    open-pull-requests-limit: 5
-    groups:
-      dev-deps:
-        dependency-type: development
-        update-types: [patch, minor]
-      prod-deps:
-        dependency-type: production
-        update-types: [patch, minor]
-```
-
-## Template T3 — Infra / config (no node, no docker build)
-
-For `infra` and similar.
-
-```yaml
-version: 2
-updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule: { interval: weekly }
-    groups:
-      actions:
-        patterns: ["*"]
-```
-
-## Applying the template
-
-```bash
-# In the .github repo
-./scripts/sync-dependabot.sh /path/to/repo
-
-# Or to dry-run
-./scripts/sync-dependabot.sh --dry-run /path/to/repo
-```
-
-The script auto-detects:
-- Dockerfile dirs (any dir containing `Dockerfile*`) → adds a docker block
-- npm workspace dirs (any dir with `package.json` not in `node_modules`) → adds an npm block
-
-If the repo has neither, it falls back to T3 (github-actions only).
-
-## Enabling security updates
-
-After applying, enable at the repo level:
-
-```bash
-gh api -X PUT /repos/skylabs-digital/<repo>/vulnerability-alerts
-gh api -X PUT /repos/skylabs-digital/<repo>/automated-security-fixes
-```
-
-Verify:
-
-```bash
-gh api /repos/skylabs-digital/<repo>/automated-security-fixes
-# → {"enabled": true, "paused": false}
-```
-
-
----
-
-# Unified Release Pipeline (`release.yml`)
-
-All Skylabs repos use a **single unified workflow** instead of the legacy
-`version.yml` + `security.yml` + `ci-*.yml` + `deploy-*.yml` quartet. One
-file per repo, 5 stages, job dependencies gating each stage.
-
-## Why unified
-
-| Problem with legacy split | Unified fix |
-|---|---|
-| Double **Auto Version** runs (version workflow re-triggered on its own `chore(release)` commit) | `[skip ci]` on bot commit — workflow doesn't re-fire |
-| Double **Docker builds** (Grype built its own image while CI built another) | Single build in Stage 3, GHCR-hosted image reused by Grype + deploy |
-| Tag push didn't trigger downstream workflows (default `GITHUB_TOKEN` can't fan out events) | GitHub App Token (`semantic-release-bot-skylabs`) for git push |
-| `workflow_dispatch` / `workflow_call` plumbing across 4 files | In-workflow `needs:` — one file, one DAG |
-| Private npm auth (`@skylabs-digital/*`) broken in Grype builds | BuildKit `--mount=type=secret,id=npm_token` in Dockerfile, `.yarnrc.yml` reads `NODE_AUTH_TOKEN` |
-
-## 5-Stage Structure
-
-```
-PR + push                 push:main only
-   │                            │
-   ▼                            ▼
-┌──────────────┐  OK    ┌─────────────┐  OK  ┌─────────────┐  OK  ┌─────────────┐  OK  ┌────────────┐
-│ 1. STATIC    │───────▶│ 2. VERSION  │─────▶│ 3. BUILD    │─────▶│ 4. IMAGE    │─────▶│ 5. DEPLOY  │
-│ CHECKS       │        │ BUMP & TAG  │      │ IMAGES      │      │ SCAN        │      │ QA + SMOKE │
-│              │        │             │      │             │      │             │      │ + ROLLBACK │
-│ ci-<svc> × N │        │ conv. cmts  │      │ parallel    │      │ Grype pulls │      │ ssh,       │
-│ osv-scan     │        │ → semver    │      │ per service │      │ from GHCR   │      │ migrate,   │
-│ gitleaks     │        │ App Token   │      │ 1 image /   │      │ .grype.yaml │      │ worker     │
-│ parallel     │        │ for git push│      │ service     │      │ fail-on     │      │ restart,   │
-│              │        │ [skip ci]   │      │ push + tag  │      │ high, only- │      │ tag qa-    │
-│              │        │ commit      │      │ vN + sha +  │      │ fixed       │      │ stable     │
-│              │        │             │      │ latest      │      │             │      │            │
-└──────────────┘        └─────────────┘      └─────────────┘      └─────────────┘      └────────────┘
-```
-
-Any stage failure halts its branch of the DAG for that service. Deploys only run when the service's `build + grype + version.bumped` all succeed.
-
-## Variants by project type
-
-| Variant | Repos | Jobs | Build stage | Deploy stage |
-|---|---|---|---|---|
-| **Multi-service app** | `noten`, `resuelto`, `idachu`, `kommi` | 11–15 | `build-api`, `build-bo`, `build-web` (as needed) | `deploy-api` (+ worker restart), `deploy-bo`, `deploy-web` |
-| **Single-service app** | `skylabs-mcp` | 7 | `build` | `deploy` (Monitor droplet) |
-| **Library (npm publish)** | `react-proto-kit`, `react-identity-access`, `menu-engine` | 4–5 | semantic-release handles version + npm publish in one step | (no deploy — `publish-gpr` mirrors to GitHub Packages) |
-
-See live examples:
-- [noten `release.yml`](https://github.com/skylabs-digital/noten/blob/main/.github/workflows/release.yml) — canonical multi-service (api + bo)
-- [resuelto `release.yml`](https://github.com/skylabs-digital/resuelto/blob/main/.github/workflows/release.yml) — 4-service (api + worker + bo + web)
-- [skylabs-mcp `release.yml`](https://github.com/skylabs-digital/skylabs-mcp/blob/main/.github/workflows/release.yml) — single-service on Monitor
-- [react-proto-kit `release.yml`](https://github.com/skylabs-digital/react-proto-kit/blob/main/.github/workflows/release.yml) — lib w/ semantic-release
-
-## Required org-level secrets / vars
-
-| Name | Type | Scope | Used for |
-|---|---|---|---|
-| `SEMANTIC_RELEASE_APP_ID` | secret | org | GitHub App id (`semantic-release-bot-skylabs`), used to mint installation tokens |
-| `SEMANTIC_RELEASE_PRIVATE_KEY` | secret | org | App private key matching the ID |
-| `GHCR_TOKEN` | secret | org | Classic PAT with `read:packages` + `write:packages` — used for npm auth (App tokens cannot read GH Packages npm) and Docker login on Droplets |
-| `DEPLOY_SSH_KEY` | secret | org | SSH key for `deploy` user on QA / Prod / Monitor droplets |
-| `QA_PRIVATE_IP` | var | org | `10.10.10.2` |
-| `PROD_PRIVATE_IP` | var | org | `10.10.10.4` |
-| `MONITOR_PRIVATE_IP` | var | org | `10.10.10.8` |
-| `BASTION_HOST` | var | org | `45.55.75.102` |
-| `BASTION_SSH_PORT` | var | org | `41222` |
-
-## Private npm packages (`@skylabs-digital/*`) in Docker builds
-
-GitHub App installation tokens authenticate OK against `npm.pkg.github.com`
-but return **403 Forbidden** when fetching tarballs — a known GH limitation
-(`packages:read` permission on the installation does not translate into npm
-registry reads). So we use the classic PAT stored as `GHCR_TOKEN`:
-
-```dockerfile
-# In the Dockerfile:
-RUN --mount=type=secret,id=npm_token \
-    NODE_AUTH_TOKEN=$(cat /run/secrets/npm_token) \
-    yarn install --immutable
-```
-
-```yaml
-# .yarnrc.yml
-npmRegistries:
-  "https://npm.pkg.github.com":
-    npmAlwaysAuth: true
-    npmAuthToken: "${NODE_AUTH_TOKEN-}"
-npmScopes:
-  skylabs-digital:
-    npmRegistryServer: "https://npm.pkg.github.com"
-```
-
-```yaml
-# In release.yml build job:
-- uses: docker/build-push-action@...
-  with:
-    secrets: |
-      npm_token=${{ secrets.GHCR_TOKEN }}
-```
-
-Repos without private `@skylabs-digital` deps (e.g. `idachu`, `kommi`,
-`skylabs-mcp`) skip the BuildKit secret plumbing entirely.
+Full callers (triggers, concurrency, permissions), every input and the stage-by-stage
+walkthrough are on the [docs site](https://docs.skylabs.digital/workflows/).
+
+## 🧑‍💻 Development
+
+- Workflows live in `.github/workflows/`; `scripts/sync-dependabot.sh` generates each repo's
+  security-only `dependabot.yml`; `bootstrap.sh` is served raw from `main`.
+- `ci.yml` runs on pull requests touching workflows, scripts or `bootstrap.sh`: actionlint, a
+  check for empty YAML mappings (they parse locally but GitHub rejects them as a "workflow file
+  issue"), and shellcheck.
+- A change to a reusable lands on every consumer at once (they track `@main`). Try it from a
+  branch first by pointing one caller at `@<branch>`.
+- A change to `bootstrap.sh` keeps its rules: readable header, pinned CLI, no secrets, no profile
+  edits, nothing installed without asking, no `sudo`.
+
+## 🚢 Releases
+
+There is no release pipeline: merging to `main` publishes the release and docs reusables
+immediately. `security.yml` is consumed at the `v1` tag, which is moved deliberately when a
+change is ready for every repo.

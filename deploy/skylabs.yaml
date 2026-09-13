@@ -1,0 +1,6 @@
+# The only thing a library declares: which folder `sl docs sync` publishes.
+# Standard: skylabs/docs/standards/docs-publishing.md
+kind: lib
+app: workflows
+docs:
+  dir: docs/public
