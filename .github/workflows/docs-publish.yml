@@ -3,15 +3,21 @@ name: Docs publish (reusable)
 # ============================================================================
 # Announces a repo's section on docs.skylabs.digital and publishes its pages.
 #
-#   1. `yarn sl cac apply --env prod --file cac/docs.ts --no-create-keys`
+#   1. `sl cac apply --env prod --file cac/docs.ts --no-create-keys`
 #        the section (slug, name, group, icon, description, owner) is config as
 #        code, declared with @skylabs-digital/docs-cac.
-#   2. `yarn sl docs sync`
+#   2. `sl docs sync`
 #        validates `docs.dir` from deploy/skylabs.yaml and uploads it.
 #
 # Both authenticate with this job's GitHub Actions OIDC token (aud
 # `docs.skylabs.digital`): no secret is needed for docs itself. GHCR_TOKEN is
-# only for `yarn install` of the private @skylabs-digital/* packages.
+# only for installing the private @skylabs-digital/* packages.
+#
+# THE `sl` HERE IS THE REUSABLE'S, not the repo's pin (`cli-version`): the
+# apps pin `sl` 1.8–1.12 for their deploy pipeline, and bumping that pin just
+# so the docs job can speak `auth: github` would change how they deploy. The
+# repo only needs `@skylabs-digital/docs-cac` (and `@skylabs-digital/cac`,
+# which an app with CaC already has) so `cac/docs.ts` resolves its imports.
 #
 # Standard: skylabs-workspace docs/standards/docs-publishing.md
 #
@@ -55,6 +61,10 @@ on:
         description: 'The CaC stack that announces the section'
         type: string
         default: 'cac/docs.ts'
+      cli-version:
+        description: 'The `sl` this job runs (>= 1.21.0: `auth: github`, `--no-create-keys` without a secrets sink, `X-Version`)'
+        type: string
+        default: '1.21.0'
       ref:
         description: >
           What to check out. Default `main`: after a release the version bump is
@@ -114,6 +124,16 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - if: steps.detect.outputs.publish == 'true'
+        name: Install sl ${{ inputs.cli-version }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          CLI_VERSION: ${{ inputs.cli-version }}
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/sl" --no-save --no-audit --no-fund \
+            "@skylabs-digital/cli@${CLI_VERSION}"
+          echo "$RUNNER_TEMP/sl/node_modules/.bin" >> "$GITHUB_PATH"
 
       # `--env prod`: the registry is global (one docs site for every
       # environment), the protocol just requires one. `--no-create-keys`: this
@@ -123,8 +143,10 @@ jobs:
         name: Announce the section (sl cac apply)
         env:
           STACK_FILE: ${{ inputs.stack-file }}
-        run: yarn sl cac apply --env prod --file "$STACK_FILE" --no-create-keys
+        run: |
+          sl -v
+          sl cac apply --env prod --file "$STACK_FILE" --no-create-keys
 
       - if: steps.detect.outputs.publish == 'true'
         name: Publish the pages (sl docs sync)
-        run: yarn sl docs sync
+        run: sl docs sync
