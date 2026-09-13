@@ -9,7 +9,10 @@ name: Docs publish (reusable)
 #   2. `sl docs sync`
 #        validates `docs.dir` from deploy/skylabs.yaml and uploads it.
 #
-# Both authenticate with this job's GitHub Actions OIDC token (aud
+#   3. a `repository_dispatch` to skylabs-digital/docs so the site rebuilds now
+#        (with the org App's token; optional, see the step).
+#
+# 1 and 2 authenticate with this job's GitHub Actions OIDC token (aud
 # `docs.skylabs.digital`): no secret is needed for docs itself. GHCR_TOKEN is
 # only for installing the private @skylabs-digital/* packages.
 #
@@ -76,6 +79,12 @@ on:
       GHCR_TOKEN:
         description: 'Read access to the private @skylabs-digital/* npm packages'
         required: false
+      SEMANTIC_RELEASE_APP_ID:
+        description: 'The org GitHub App, to ask the docs repo for a rebuild (optional: without it the site rebuilds on its 15-minute cron)'
+        required: false
+      SEMANTIC_RELEASE_PRIVATE_KEY:
+        description: 'Private key of that App'
+        required: false
 
 jobs:
   publish:
@@ -85,6 +94,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      # Secrets cannot appear in a step's `if`; this can.
+      HAS_APP: ${{ secrets.SEMANTIC_RELEASE_APP_ID != '' && secrets.SEMANTIC_RELEASE_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -149,4 +161,47 @@ jobs:
 
       - if: steps.detect.outputs.publish == 'true'
         name: Publish the pages (sl docs sync)
+        id: sync
         run: sl docs sync
+
+      # ASK THE SITE TO REBUILD NOW. The docs service stores the pages and marks
+      # the site dirty, but it cannot start the build itself (it would need a
+      # token of its own, DOCS_DISPATCH_TOKEN). This job already has the org App,
+      # which can send a `repository_dispatch` to skylabs-digital/docs
+      # (`contents: write`). Builds there collapse by themselves (one running,
+      # at most one pending, and the pending one reads the whole store when it
+      # starts), so twenty repos publishing at once cost two builds, not twenty.
+      # Without the App, or if this fails, the build's 15-minute cron picks the
+      # publication up: this step only saves the wait.
+      - if: steps.sync.outcome == 'success' && env.HAS_APP == 'true'
+        name: Token to ask docs for a rebuild
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: docs
+
+      - if: steps.app-token.outputs.token != ''
+        name: Ask docs to rebuild now
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORIGEN: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The payload goes by stdin: nothing of it passes through argv.
+          codigo="$(jq -nc --arg o "$ORIGEN" '{event_type: "docs-seccion-publicada", client_payload: {origen: $o}}' \
+            | curl -sS -o /dev/null -w '%{http_code}' -X POST \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/docs/dispatches" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                --data-binary @-)" || codigo=000
+          if [ "$codigo" = "204" ]; then
+            echo "rebuild requested: the site shows this section in a few minutes"
+          else
+            echo "::warning title=docs::could not ask docs for a rebuild (HTTP ${codigo}); its 15-minute cron will pick this publication up."
+          fi
