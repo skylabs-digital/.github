@@ -5,12 +5,15 @@ name: CI (reusables lint)
 # stub "workflow file issue" post-push — y en main rompería a los 25
 # consumidores en el acto. Bead sl-bh3 (wrapper), análisis
 # 2026-08-24-pipeline-drift-assessment.md (Addendum).
+# SIN `paths:` A PROPOSITO. `actionlint + parser checks` es el UNICO check que
+# el ruleset protect-main exige para mergear, y un check que no corre nunca se
+# queda en "expected": un PR que no toca workflows (docs, README, plantillas)
+# queda trabado para siempre y ni un admin lo puede mergear — el unico bypass
+# del ruleset es la App semantic-release-bot-skylabs. Le paso a #38 (docs del
+# repo). Correrlo siempre cuesta ~30 s de runner y hace que el check signifique
+# lo mismo en todos los PRs.
 on:
   pull_request:
-    paths:
-      - '.github/workflows/**'
-      - 'scripts/**'
-      - 'bootstrap.sh'
 
 permissions:
   contents: read
