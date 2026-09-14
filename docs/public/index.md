@@ -24,6 +24,7 @@ permissions, then hands the whole pipeline to one of these.
 | [`lib-release.yml`](./lib-release.md) | libraries | CI, mutation testing, security, semantic-release to GitHub Packages |
 | [`security.yml`](./security.md) | the two above, and repos with no release pipeline | OSV-Scanner, Gitleaks, Grype, a weekly rolling issue |
 | [`docs-publish.yml`](./docs-publish.md) | every repo with `docs/public/` | announces the docs section and publishes the pages, with its own `sl` and the job's OIDC token |
+| [`deploy-manual.yml`](./deploy-manual.md) | apps, on demand | the Actions button that deploys a chosen tag — one `sl deploy`, no second deploy implementation |
 
 ```mermaid
 flowchart LR
