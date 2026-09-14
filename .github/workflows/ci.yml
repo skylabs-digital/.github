@@ -21,7 +21,31 @@ permissions:
 jobs:
   lint:
     name: actionlint + parser checks
-    runs-on: [self-hosted, linux, x64, skylabs]
+    # ⚠️ NO VOLVER A `[self-hosted, linux, x64, skylabs]`.
+    #
+    # Este es el ÚNICO repo público de la org (los otros 40 son privados) y
+    # este es su único workflow que dispara con un evento no confiable
+    # (`pull_request`, que incluye PRs desde forks de desconocidos). El pool
+    # self-hosted es un host persistente y compartido: entre jobs sólo se
+    # limpian los contenedores, `_work` y las credenciales del agente — todo
+    # lo demás ($HOME, /usr/local/bin, cron, ~/.bashrc, la caché de yarn)
+    # sobrevive. Y es el MISMO pool donde corren `provision-env`, `operators`
+    # y el deploy de prod, con SOPS_AGE_KEY y DEPLOY_SSH_KEY en el entorno.
+    #
+    # La política de forks de la org es `first_time_contributors`: alcanza con
+    # aprobarle una sola PR de tipeo a un desconocido para que tenga corridas
+    # automáticas sobre ese pool para siempre. Un PR de fork no recibe secrets
+    # —no los necesita— porque lo que gana es escritura persistente en el host
+    # que los otros jobs sí usan.
+    #
+    # Acá no hace falta nada del pool: este job sólo lintea archivos del
+    # checkout. `ubuntu-latest` es una VM descartable y, en un repo público, no
+    # consume minutos. Bead sl-41bx (P0).
+    #
+    # El NOMBRE del job no se toca: `actionlint + parser checks` es el único
+    # required status check del ruleset `protect-main` de este repo, y
+    # renombrarlo dejaría todos los PRs trabados en "expected".
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -42,6 +66,13 @@ jobs:
       # parser de GitHub no, y el resultado es el stub "workflow file issue".
       - name: Empty-mapping check
         run: |
+          # PyYAML venía puesto en el runner self-hosted y viene en la imagen
+          # de ubuntu-latest, pero el check no puede quedar verde sin haber
+          # corrido: si falta, se instala. `--break-system-packages` es por el
+          # PEP 668 de Ubuntu 24.04; el segundo intento es para un pip < 23.
+          python3 -c 'import yaml' 2>/dev/null \
+            || pip install --quiet --disable-pip-version-check --break-system-packages pyyaml \
+            || pip install --quiet --disable-pip-version-check pyyaml
           python3 - <<'PY'
           import sys, yaml, glob
           bad = []
