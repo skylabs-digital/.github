@@ -745,10 +745,16 @@ jobs:
   cac-apply:
     name: CaC apply (${{ inputs.deploy-env }})
     needs: [version, deploy]
-    # `skipped` es el caso de `deploy: false`: no hubo deploy que esperar, pero
-    # la identidad de la app en las plataformas se aplica igual. Un deploy que
-    # FALLÓ no entra — ahí lo último que se quiere es mover la configuración.
-    if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')"
+    # El caso de `deploy: false` se pregunta por el INPUT, no por
+    # `needs.deploy.result == 'skipped'`. GitHub reporta `skipped` por dos
+    # motivos distintos: el `if:` del job dio falso (que es lo que se quería
+    # dejar pasar) Y el job no corrió porque alguno de sus `needs` FALLÓ
+    # —`deploy` necesita `build-images` y `matrix`—. Con la condición vieja, un
+    # build de imagen en rojo saltaba igual a `cac-apply` y movía el catálogo de
+    # idachu/noten/fisto a una versión que nunca se construyó. Un deploy que
+    # FALLÓ no entra: ahí lo último que se quiere es mover la configuración.
+    # Bead sl-24x5.
+    if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     environment: ${{ inputs.deploy-env }}
     steps:
