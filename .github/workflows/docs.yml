@@ -1,0 +1,33 @@
+name: Docs
+
+# Este repo no tiene release (es el de los reusables), así que su sección de
+# docs.skylabs.digital se publica desde acá: el mismo reusable que llama el
+# `release.yml` de todos los demás. Estándar:
+# skylabs/docs/standards/docs-publishing.md §6.
+#
+# `cli-version`: 1.23.2 o más nuevo. Hasta ahí `sl docs sync` rechazaba este
+# repo por llamarse `.github` ("no es un `owner/repo`", sl-210), y la sección
+# se publicó a mano.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/public/**'
+      - 'cac/docs.ts'
+      - 'deploy/skylabs.yaml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    uses: skylabs-digital/.github/.github/workflows/docs-publish.yml@main
+    with:
+      cli-version: '1.24.0'
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
