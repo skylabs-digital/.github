@@ -1,0 +1,314 @@
+name: Deploy Manual (reusable)
+
+# ============================================================================
+# El botón de deploy a mano de la flota, sin una segunda implementación de
+# deploy.
+#
+# Hasta 2026-09-14 cuatro repos (resuelto, idachu, noten, kommi) llevaban su
+# PROPIO `deploy-manual.yml`: ~150 líneas de appleboy/ssh-action con su login a
+# GHCR, su `docker compose run --rm <app>-migrator`, su
+# `/opt/skylabs/scripts/deploy-service.sh` por ruta fija, su reinicio de
+# workers, su smoke y (en resuelto) su rollback. Cuatro copias de lo que
+# `app-release.yml` v2 ya dejó de hacer: el camino de release despliega con
+# `sl deploy` desde 2026-09-10, y las copias a mano no leen el descriptor
+# (`deploy/skylabs.yaml`) ni `.last-good-tags`. Dos implementaciones del mismo
+# acto divergen — es cuestión de cuándo, no de si.
+#
+# Este reusable conserva LA AFORDANCIA (un botón en Actions, con traza de
+# auditoría, usable sin laptop) y tira la implementación duplicada: instala el
+# `sl` que el repo llamador tiene pineado y corre `sl deploy` con los inputs.
+# Lo que el deploy hace —migraciones, orden de servicios, workers, smoke,
+# promote, borde y monitoreo— lo decide el descriptor de la app y el CLI, igual
+# que en el release. Ver skylabs/docs/standards/deploy-descriptor.md §6.
+#
+# ----------------------------------------------------------------------------
+# CÓMO LLAMARLO (caller mínimo, `.github/workflows/deploy-manual.yml`):
+#
+#   name: Deploy Manual
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         environment: { type: choice, options: [qa, prod], required: true }
+#         service:     { type: choice, options: ['', app-api, app-web] }
+#         tag:         { type: string, required: true }
+#         confirm:     { type: string, default: '' }
+#   jobs:
+#     deploy:
+#       uses: skylabs-digital/.github/.github/workflows/deploy-manual.yml@main
+#       with:
+#         environment: ${{ inputs.environment }}
+#         service: ${{ inputs.service }}
+#         tag: ${{ inputs.tag }}
+#         confirm: ${{ inputs.confirm }}
+#       secrets: inherit
+#
+# El `type: choice` de los servicios vive en el CALLER y no acá: `workflow_call`
+# no tiene `choice`, y además los servicios los declara el descriptor de cada
+# app. El caller pone la lista para que el desplegable de Actions la muestre;
+# si se desincroniza del descriptor, `sl deploy` rechaza el nombre y dice cuáles
+# son los válidos (`ordenarServicios`, cli/src/deploy/contexto.ts).
+#
+# ----------------------------------------------------------------------------
+# QUÉ REF SE DESPLIEGA. Este workflow NO pasa `ref:` al checkout: usa el que el
+# operador eligió en el desplegable "Use workflow from" de Actions, que acepta
+# ramas Y TAGS. Elegir ahí el mismo `vX.Y.Z` que se pone en `tag` es lo que
+# hace que el descriptor, el fragmento de compose y los secretos que se empujan
+# al droplet sean los de esa versión y no los de la punta de main.
+#
+# ----------------------------------------------------------------------------
+# SEGURIDAD. Ningún input llega a un `run:` ni a un comando remoto por `${{ }}`:
+# todos entran por `env:` y se usan como variable de shell entrecomillada. La
+# sustitución de `${{ }}` la hace el motor de plantillas ANTES de que exista un
+# shell, así que las comillas del YAML no protegen nada — es el invariante que
+# kommi documentó en bd kommi-5sc0 y que acá se cumple estructuralmente. Las
+# apariciones de `${{ inputs.* }}` que quedan son `name:`, `if:` y
+# `concurrency:`, que no son texto de shell.
+#
+# El alfabeto del tag y del nombre de servicio los valida el CLI antes de
+# componer un solo comando remoto (`assertTag` / `assertName`, spec §9), así que
+# acá no se duplica el regex OCI que tenía kommi.
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'qa | prod — el GitHub Environment y el entorno de `sl deploy`'
+        type: string
+        required: true
+      tag:
+        description: >
+          Tag de imagen a desplegar (`vX.Y.Z`, un sha, `latest`). Obligatorio:
+          sin tag el compose cae a `:latest`, que es el bug histórico que
+          `sl deploy` cierra.
+        type: string
+        required: true
+      service:
+        description: >
+          Servicio suelto (`resuelto-api`) o vacío para desplegar la app
+          entera. OJO: con servicio, `sl deploy` corre helpers, fragmento y ESE
+          servicio — sin migraciones, sin borde y sin monitoreo. Las
+          migraciones sólo corren en el deploy completo.
+        type: string
+        default: ''
+      confirm:
+        description: "Para environment=prod: escribí exactamente 'prod'"
+        type: string
+        default: ''
+      skip-migrate:
+        description: 'Deploy completo sin migraciones (`sl deploy --skip-migrate`)'
+        type: boolean
+        default: false
+      rollback-on-failure:
+        description: >
+          Si el deploy falla, `sl deploy <env> rollback [servicio]` vuelve al
+          último tag promovido (`.last-good-tags`). Igual que el job `deploy`
+          de app-release.yml. Se apaga para un deploy deliberado de un tag
+          viejo, donde revertir desharía justo lo que se pidió.
+        type: boolean
+        default: true
+      node-version:
+        description: 'Node version'
+        type: string
+        default: '24'
+      runner-labels:
+        description: 'JSON array of runner labels'
+        type: string
+        default: '["self-hosted","linux","x64","skylabs"]'
+    secrets:
+      GHCR_TOKEN:
+        description: 'Classic PAT (read:packages) para `yarn install` de los @skylabs-digital/* y el fallback del checkout de infra'
+        required: false
+      DEPLOY_SSH_KEY:
+        description: 'SSH key del usuario deploy en los droplets (se mapea a SL_SSH_KEY)'
+        required: false
+      SOPS_AGE_KEY:
+        description: 'Clave age de CI de la flota (identidad ci-github-actions). Descifra deploy/secrets/<env>.env'
+        required: false
+      INFRA_READ_TOKEN:
+        description: 'Secret de organización, sólo lectura de skylabs-digital/infra (sparse checkout de registry/). Cae a GHCR_TOKEN'
+        required: false
+
+# Mismo motivo que en app-release.yml: con los hooks en `postinstall`,
+# `yarn install` los instala también en el runner y cualquier operación de git
+# del workflow los dispararía. CI es el gate, no los hooks.
+env:
+  HUSKY: 0
+
+jobs:
+  # ============================================================
+  # GATE — entorno válido y confirmación tipeada para prod.
+  #
+  # Va en un job APARTE y SIN `environment:` a propósito. Las reglas de
+  # protección del Environment se evalúan cuando el job ARRANCA, así que un
+  # chequeo dentro del job de deploy despertaría a los aprobadores de prod para
+  # después morir por un `confirm` vacío. Acá corta antes, gratis y en rojo.
+  #
+  # Rojo y no `skipped` (a diferencia del `if:` a nivel job de
+  # infra/provision-env.yml): un run entero en verde con todo salteado se lee
+  # como "desplegado" desde la lista de Actions, que es el peor final posible
+  # para un deploy a producción que no ocurrió.
+  # ============================================================
+  guard:
+    name: Gate (${{ inputs.environment }})
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Validar entorno y confirmación
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          case "${DEPLOY_ENV}" in
+            qa|prod) ;;
+            *)
+              echo "::error title=Entorno inválido::environment es \"${DEPLOY_ENV}\"; los que hay son qa y prod."
+              exit 1
+              ;;
+          esac
+
+          if [ "${DEPLOY_ENV}" = "prod" ] && [ "${CONFIRM}" != "prod" ]; then
+            echo "::error title=Falta la confirmación::Un deploy a prod pide escribir exactamente 'prod' en el campo confirm."
+            exit 1
+          fi
+
+          {
+            echo "### Deploy manual"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| entorno | \`${DEPLOY_ENV}\` |"
+            echo "| servicio | \`${SERVICE:-(la app entera)}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| ref del checkout | \`${GITHUB_REF}\` |"
+            echo "| lo pidió | @${GITHUB_ACTOR} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # DEPLOY — una sola invocación de `sl deploy`, igual que el release.
+  # ============================================================
+  deploy:
+    name: sl deploy ${{ inputs.environment }} ${{ inputs.service }} ${{ inputs.tag }}
+    needs: [guard]
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    # Un `sl deploy` colgado contra un droplet retendría un runner self-hosted
+    # hasta que alguien lo mate a mano. Un deploy real son minutos; 30 cubre el
+    # completo (migraciones + servicios + borde + monitoreo) con aire.
+    timeout-minutes: 30
+    # Un deploy a la vez por (entorno, servicio), y NUNCA se cancela a mitad:
+    # cancelar entre el `up` y el promote deja el droplet en un estado que nadie
+    # pidió. El release corre en su propio grupo (`release-*`) y podría solaparse
+    # con éste: la exclusión real la da el `flock` por app del lado del droplet
+    # (cli/src/deploy/plan.ts, conLock), no este grupo.
+    concurrency:
+      group: deploy-manual-${{ inputs.environment }}-${{ inputs.service || 'app' }}
+      cancel-in-progress: false
+    steps:
+      # Sin `ref:`: el checkout es el que el operador eligió en "Use workflow
+      # from" (rama o tag). Es de dónde salen deploy/skylabs.yaml,
+      # deploy/compose.yml y deploy/secrets/<env>.env.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # El registro de la plataforma: sparse checkout de infra, sólo registry/.
+      # De ahí salen el bastión, las IPs privadas y los recipients age.
+      # Idéntico al job `deploy` de app-release.yml, mismo `path`.
+      - name: Checkout del registro (sparse)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: skylabs-digital/infra
+          path: .infra-registry
+          sparse-checkout: registry
+          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
+
+      - name: Install sops (pinned + checksum)
+        # Mismo pin y mismo checksum que app-release.yml y que
+        # infra/.github/workflows/provision-env.yml.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -x "$HOME/.local/bin/sops-v3.11.0" ]; then
+            curl -sSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64"
+            echo "775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef  /tmp/sops" | sha256sum -c -
+            install -m 0755 /tmp/sops "$HOME/.local/bin/sops-v3.11.0"
+          fi
+          ln -sf "$HOME/.local/bin/sops-v3.11.0" "$HOME/.local/bin/sops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+      # El `sl` que se usa es el que ESTE repo tiene pineado en su package.json
+      # (`@skylabs-digital/cli`), no uno que el reusable elija: el deploy y el
+      # release usan por construcción la misma versión, y con ella la misma
+      # carpeta de helpers en el droplet (/opt/skylabs/bin/<versión>/).
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: sl deploy
+        id: deploy
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          # Texto humano en el log del job: `sl` saca JSON por defecto fuera de
+          # una TTY, y un JSON de 200 líneas no se lee en Actions.
+          SL_FORMAT: text
+          # Explícito y no sólo heredado del runner: evita el prompt interactivo
+          # de confirmación en prod (`ctx.env.CI !== "true"` en deploy.ts). El
+          # gate deliberado de prod acá es el `confirm` tipeado del job `guard`
+          # más el GitHub Environment, no un prompt que nadie puede contestar.
+          CI: 'true'
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ inputs.tag }}
+          SKIP_MIGRATE: ${{ inputs.skip-migrate }}
+        run: |
+          set -euo pipefail
+          ARGS=("${DEPLOY_ENV}")
+          if [ -n "${SERVICE}" ]; then
+            ARGS+=("${SERVICE}")
+          fi
+          ARGS+=(--tag "${TAG}")
+          if [ "${SKIP_MIGRATE}" = "true" ]; then
+            ARGS+=(--skip-migrate)
+          fi
+          echo "yarn sl deploy ${ARGS[*]}"
+          yarn sl deploy "${ARGS[@]}"
+
+      # Mismo rollback que el job `deploy` de app-release.yml, y por el mismo
+      # motivo: un deploy que falló deja la imagen rota sirviendo tráfico. NO
+      # necesita SOPS_AGE_KEY — `rollback` no descifra nada, le pide al droplet
+      # que vuelva al último tag promovido.
+      #
+      # `steps.deploy.outcome != 'skipped'`: si lo que falló fue el checkout, el
+      # install o sops, no se desplegó nada y un rollback DEGRADARÍA un servicio
+      # sano. Sólo se revierte si el deploy llegó a correr.
+      - name: Rollback on failure
+        if: ${{ failure() && inputs.rollback-on-failure && steps.deploy.outcome != 'skipped' }}
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          SL_FORMAT: text
+          CI: 'true'
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          echo "::warning::El deploy falló — revirtiendo ${SERVICE:-la app} en ${DEPLOY_ENV}"
+          ARGS=("${DEPLOY_ENV}" rollback)
+          if [ -n "${SERVICE}" ]; then
+            ARGS+=("${SERVICE}")
+          fi
+          yarn sl deploy "${ARGS[@]}"
