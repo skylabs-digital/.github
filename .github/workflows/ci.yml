@@ -46,6 +46,7 @@ jobs:
     # required status check del ruleset `protect-main` de este repo, y
     # renombrarlo dejaría todos los PRs trabados en "expected".
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 

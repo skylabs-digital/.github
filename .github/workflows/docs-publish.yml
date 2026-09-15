@@ -90,6 +90,7 @@ jobs:
   publish:
     name: Announce and publish docs
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 15
     continue-on-error: true
     permissions:
       contents: read

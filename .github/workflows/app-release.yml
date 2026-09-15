@@ -189,6 +189,14 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'repository_dispatch'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Todos los jobs de este archivo corren en la pool self-hosted, que son
+    # NUEVE runners para toda la flota: uno colgado no se recicla solo como una
+    # VM de GitHub, se queda con su lugar hasta que alguien lo mate a mano. Las
+    # cotas salen de medir 228 jobs reales de cinco repos (2026-09-14): el más
+    # lento de todos fue el Deploy, con 14 minutos. Cada número de acá es ese
+    # techo medido con aire de sobra — no es un presupuesto, es el punto donde
+    # dejamos de creerle al job.
+    timeout-minutes: 10
     outputs:
       services: ${{ steps.sl.outputs.services }}
     steps:
@@ -240,6 +248,7 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
     name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - run: corepack enable
@@ -303,6 +312,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       !contains(github.event.head_commit.message, 'chore(release):')
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.bump.outputs.version }}
       bumped: ${{ steps.bump.outputs.bumped }}
@@ -519,6 +529,7 @@ jobs:
     needs: [version, matrix]
     if: needs.version.outputs.bumped == 'true'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -565,6 +576,7 @@ jobs:
     needs: [version, build-images, matrix]
     if: needs.version.outputs.bumped == 'true' && inputs.deploy
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 30
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -704,6 +716,7 @@ jobs:
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     needs: static-checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -756,6 +769,7 @@ jobs:
     # Bead sl-24x5.
     if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -831,6 +845,7 @@ jobs:
     name: Secrets rotate (recipients del registro)
     if: github.event_name == 'repository_dispatch' && github.event.action == 'skylabs-operators-changed'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: 15
     # SIN `environment:`, a diferencia de `deploy`. `SOPS_AGE_KEY` es secret de
     # ORGANIZACIÓN (ver el bloque `secrets:` de arriba), así que un Environment
     # no cambia de dónde sale la llave: sólo agrega su deployment branch policy
