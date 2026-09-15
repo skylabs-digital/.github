@@ -154,6 +154,14 @@ jobs:
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     permissions:
       contents: read
+    # El gate es un `case` de shell y un heredoc al summary: son segundos. El
+    # bound no lo pide su duración sino DÓNDE corre — un runner self-hosted, que
+    # es un recurso de la flota y no una VM que GitHub recicla sola. Un job sin
+    # `timeout-minutes` ahí se queda con el runner hasta que alguien lo mate a
+    # mano, y el caller no puede ponerle el bound él: Actions rechaza
+    # `timeout-minutes` en un job que es un `uses:`. O sea que si no está acá,
+    # no está en ningún lado.
+    timeout-minutes: 5
     steps:
       - name: Validar entorno y confirmación
         env:

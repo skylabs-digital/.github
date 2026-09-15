@@ -51,6 +51,7 @@ jobs:
     if: ${{ !inputs.gitleaks-only }}
     name: OSV-Scanner (deps)
     runs-on: [self-hosted, linux, x64, skylabs]
+    timeout-minutes: 20
     outputs:
       summary_b64: ${{ steps.gate.outputs.summary_b64 }}
     steps:
@@ -174,6 +175,7 @@ jobs:
   secrets-scan:
     name: Gitleaks (secrets in code + history)
     runs-on: [self-hosted, linux, x64, skylabs]
+    timeout-minutes: 20
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
@@ -225,6 +227,7 @@ jobs:
     if: ${{ inputs.docker-images != '[]' && github.event_name != 'pull_request' }}
     name: Grype (${{ matrix.image.name }})
     runs-on: [self-hosted, linux, x64, skylabs]
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -392,6 +395,7 @@ jobs:
     if: ${{ always() && github.event_name == 'schedule' && !inputs.gitleaks-only }}
     needs: [osv-scan]
     runs-on: [self-hosted, linux, x64, skylabs]
+    timeout-minutes: 15
     steps:
       - name: Upsert rolling issue
         continue-on-error: true
