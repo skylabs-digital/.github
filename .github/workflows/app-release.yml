@@ -733,14 +733,24 @@ jobs:
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - name: Detect cac/stack.ts
+      # Decide ACÁ si el job hace algo, antes de instalar nada y antes de pedirle
+      # el registro a otro repo. Con el chequeo de la key metido más abajo, un
+      # repo sin key igual hacía `yarn install` y el checkout de infra, y moría
+      # en ese checkout en vez de saltearse: el `Not Found` de un repo al que su
+      # token no llega tapaba un caso que siempre fue un skip inofensivo.
+      - name: ¿Corre CaC en este repo?
         id: stack
+        env:
+          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
-          if [ -f cac/stack.ts ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC plan skipped."
+          elif [ -z "${IDACHU_CAC_KEY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
       - run: corepack enable
         if: steps.stack.outputs.present == 'true'
@@ -776,10 +786,6 @@ jobs:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
         run: |
-          if [ -z "${IDACHU_CAC_KEY}" ]; then
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped."
-            exit 0
-          fi
           # `sl` collapses "plan with changes" and "plan with orphans" into the
           # same exit 2 (cli/src/cac/run.ts: "cualquier acción que no sea
           # `noop`, huérfanos incluidos"). The two are NOT the same thing here:
@@ -842,14 +848,21 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: v${{ needs.version.outputs.version }}
-      - name: Detect cac/stack.ts
+      # Mismo motivo que en `cac-plan`: se decide antes de instalar y antes de
+      # pedirle el registro a infra.
+      - name: ¿Corre CaC en este repo?
         id: stack
+        env:
+          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
-          if [ -f cac/stack.ts ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC apply skipped."
+          elif [ -z "${IDACHU_CAC_KEY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
       - run: corepack enable
         if: steps.stack.outputs.present == 'true'
@@ -882,10 +895,6 @@ jobs:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
         run: |
-          if [ -z "${IDACHU_CAC_KEY}" ]; then
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
-            exit 0
-          fi
           # Exit 2 here means the apply worked but left orphans: resources the
           # stack no longer declares. It is a finding, not a failure, and this
           # job runs AFTER the deploy — reddening the release once the images
