@@ -57,114 +57,175 @@
 # hace seguro el borrado. El resto de la action (contar y borrar) es trivial
 # con `gh api`; la parte que no sabe hacer es la que importa.
 #
-# ── PERMISOS ──────────────────────────────────
+# ── PERMISOS: por qué esto corre en CADA REPO y no acá ──
 #
-# `DELETE /orgs/{org}/packages/container/{pkg}/versions/{id}` exige permiso de
-# admin sobre EL PAQUETE. El `GITHUB_TOKEN` de este repo sólo alcanza a los
-# paquetes ligados a ESTE repo, y los 27 son de otros repos: no sirve. Por eso
-# el job usa el token de la App de la org (`SEMANTIC_RELEASE_APP_ID` +
-# `SEMANTIC_RELEASE_PRIVATE_KEY`, ya presentes como secrets de organización y
-# ya usados por app-release.yml / lib-release.yml / docs-publish.yml), que hay
-# que instalar con permiso de organización **Packages: write**.
+# Hasta 2026-09-16 este workflow corría centralizado en `.github`, con el token
+# de la App de la org, y NUNCA funcionó: fallaba en su preflight. El mensaje de
+# error culpaba a un permiso faltante y mandaba a otorgar **Packages: write** a
+# la App — que ya lo tenía. El diagnóstico correcto es otro:
 #
-# Si a la App todavía no se le otorgó ese permiso, el preflight de abajo corta
-# el job con el mensaje exacto de qué conceder. NO se inventa un secret nuevo:
-# si se decide ir por un PAT clásico con `delete:packages` en vez de la App, se
-# cambia acá y se documenta en el mismo lugar.
-# ──────────────────────────────────────────────
-name: GHCR retention
+#   `packages` es un permiso de REPOSITORIO; `/orgs/{org}/packages` es un
+#   endpoint de ORGANIZACIÓN. Un installation token no lo alcanza, tenga el
+#   permiso o no.
+#
+# Verificado por diferencia: un PAT clásico lista los paquetes de la org sin
+# problema; el token de la App no, con `packages: write` puesto.
+#
+# ── LO QUE SÍ FUNCIONA, medido ──
+#
+# Los 27 paquetes de contenedor están LIGADOS a su repo (`.repository.name` no
+# es null en ninguno), y GitHub otorga el rol `admin` sobre un paquete al repo
+# cuyo workflow lo publicó — que es exactamente nuestro caso, porque las
+# imágenes las construye `build-images` de app-release.yml en cada repo.
+#
+# La documentación de GitHub dice las dos cosas, y se contradice:
+#
+#   docs/rest/packages         "OAuth app tokens and personal access tokens
+#                              (classic) need the read:packages scope" — no
+#                              menciona GITHUB_TOKEN.
+#   docs/packages/deleting-…   "If your workflow publishes a package, the
+#                              `admin` role is granted by default to the
+#                              repository where the workflow is stored."
+#
+# Manda la segunda. Probado el 2026-09-16 con un workflow de sólo lectura en
+# fisto (rama temporal, ya borrada), con `permissions: packages: write`:
+#
+#   GET /orgs/skylabs-digital/packages/container/fisto-api/versions
+#   → HTTP/2.0 200 OK, tres versiones con sus tags
+#
+# Por eso este archivo es un `workflow_call`: corriendo en el contexto del repo
+# que llama, su `GITHUB_TOKEN` alcanza sus propios paquetes. Sin App, sin PAT y
+# sin secreto de organización — que además es lo que permite bajar
+# SEMANTIC_RELEASE_* a `visibility: private`, del que `.github` (el único repo
+# PÚBLICO de la org) quedaría afuera.
+#
+# ── CÓMO SE SABE QUÉ PAQUETES SON MÍOS ──
+#
+# No por la API: leído con `GITHUB_TOKEN`, `.repository` del paquete vuelve
+# `null` (medido en la misma prueba), así que no se puede descubrir la
+# pertenencia desde acá. Los nombres llegan por el input `packages`, que
+# app-release.yml arma con la salida de `sl app services` — el descriptor del
+# repo, que es la fuente de verdad de qué imágenes construye.
+#
+# COROLARIO, y es una limitación real: un paquete que ya no está en el
+# descriptor NO lo alcanza nadie. Al 2026-09-16 hay cinco así, con 136
+# versiones entre todos:
+#
+#   ns-api                    83 versiones, última 2026-03-19
+#   ns-bo                     35 versiones, última 2026-03-17
+#   kommi-frontend            12 versiones, última 2026-04-07
+#   loving.wedding/backend     3 versiones, última 2026-08-31
+#   loving.wedding/frontend    3 versiones, última 2026-08-31
+#
+# Esos no son un problema de retención sino de borrado entero, una sola vez, a
+# mano y por una persona. Ver
+# skylabs/docs/runbooks/apps-y-credenciales-de-la-org.md §4.
 
 on:
-  schedule:
-    # Lunes 05:00 UTC (02:00 ART): fuera de la ventana de releases y deploys.
-    # Semanal alcanza — el crecimiento es de decenas de versiones por semana,
-    # no por hora, y diario sería ruido en la lista de runs.
-    - cron: '0 5 * * 1'
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      packages:
+        description: 'JSON array con los nombres de paquete a podar. Lo arma app-release.yml desde `sl app services`.'
+        required: true
+        type: string
       dry-run:
-        description: 'Sólo imprimir el plan, sin borrar nada. Empezá siempre por acá.'
+        description: 'Sólo imprimir el plan, sin borrar nada.'
         type: boolean
         default: true
       keep:
         description: 'Cuántas versiones conservar por fecha, además de las que lleven tag de entorno.'
         type: string
         default: '3'
-      package:
-        description: 'Limitar a un paquete (ej. noten-api). Vacío = los 27.'
-        type: string
-        default: ''
       max-deletes:
         description: 'Cota de borrados por corrida (la próxima sigue donde quedó). 0 = sin cota.'
         type: string
         default: '500'
 
+# NO hay `schedule` ni `workflow_dispatch` acá a propósito: un disparador en
+# este repo correría en el contexto de `.github`, cuyo GITHUB_TOKEN no alcanza
+# los paquetes de los otros repos — que es exactamente por qué la versión
+# centralizada nunca funcionó. El disparador vive en el repo dueño de las
+# imágenes: app-release.yml llama a este reusable tras un release verde.
+
 permissions:
   contents: read
 
 concurrency:
-  group: ghcr-retention
+  group: ghcr-retention-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   retention:
-    name: plan + borrado de versiones viejas
-    # NO usar `[self-hosted, linux, x64, skylabs]`. Mismo razonamiento que
-    # ci.yml: este es el único repo PÚBLICO de la org, y acá encima el job
-    # sostiene una credencial que puede borrar imágenes de toda la flota. El
-    # pool self-hosted es un host persistente compartido con `provision-env`,
-    # `operators` y el deploy de prod. Este job sólo habla con la API de
-    # GitHub: una VM descartable es lo correcto, y en un repo público no
-    # consume minutos.
+    name: Poda de imágenes viejas (GHCR)
+    # Runner efímero a propósito: este job sólo habla con la API de GitHub. No
+    # necesita el pool self-hosted (que es un host persistente compartido con
+    # provision-env, operators y el deploy de prod), y corriendo en el repo de
+    # cada app tampoco sostiene ya ninguna credencial de organización.
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      # Lo único que hace falta. `GITHUB_TOKEN` con este permiso alcanza los
+      # paquetes LIGADOS a este repo, que son los que este repo publicó.
+      packages: write
     steps:
-      # El token de la App: efímero, de organización, sin PAT largo dando vueltas.
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
-        with:
-          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
-          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      # Falla temprano y con nombre y apellido: sin esto, la falta de permiso
-      # aparecería como un 403 a mitad del borrado, con parte del plan aplicado.
-      - name: Preflight — el token puede leer los paquetes de la org
+      # Prueba la operación REAL sobre el primer paquete, no una operación
+      # parecida: el modo de falla que importa es un 403 a mitad del borrado,
+      # con parte del plan aplicado. Y si falla, dice qué se pidió y qué
+      # devolvió — no manda a cambiar un permiso.
+      - name: Preflight — este repo puede leer las versiones de sus paquetes
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ORG: ${{ github.repository_owner }}
+          PACKAGES: ${{ inputs.packages }}
         run: |
-          set -euo pipefail
-          if ! gh api "/orgs/${ORG}/packages?package_type=container&per_page=1" >/dev/null 2>&1; then
-            echo "::error::El token no puede listar los paquetes de ${ORG}."
-            echo "NO es falta de permiso: la App semantic-release-bot-skylabs ya" >&2
-            echo "tiene 'packages: write'. Ese es un permiso de REPOSITORIO y" >&2
-            echo "/orgs/{org}/packages es un endpoint de ORGANIZACIÓN, que un" >&2
-            echo "installation token no alcanza. Verificado por diferencia: un PAT" >&2
-            echo "lista los paquetes de la org; el token de la App no, con el" >&2
-            echo "permiso puesto. Agregarle permisos en Settings no cambia nada." >&2
-            echo "" >&2
-            echo "El arreglo es de diseño, no de credencial: los 27 paquetes están" >&2
-            echo "LIGADOS a su repo, así que cada repo puede podar los suyos con su" >&2
-            echo "propio GITHUB_TOKEN y no hace falta credencial de organización." >&2
-            echo "Ver skylabs/docs/runbooks/apps-y-credenciales-de-la-org.md §4." >&2
+          set -uo pipefail
+
+          first=$(printf '%s' "${PACKAGES}" | jq -r '.[0] // empty')
+          if [ -z "${first}" ]; then
+            echo "::error::El input \`packages\` vino vacío. app-release.yml lo arma desde \`sl app services\`; si este repo no declara servicios, no debería estar llamando a este reusable."
             exit 1
           fi
-          echo "OK — el token lee los paquetes de la org."
+
+          enc=$(printf '%s' "${first}" | sed 's|/|%2F|g')
+          path="/orgs/${ORG}/packages/container/${enc}/versions?per_page=1"
+
+          if out=$(gh api "${path}" 2>&1); then
+            echo "OK — este repo lee las versiones de sus paquetes."
+            echo "  probado: GET ${path}"
+            exit 0
+          fi
+
+          echo "::error::No se pudieron leer las versiones de ${first}."
+          {
+            echo "Se pidió:   GET ${path}"
+            echo "Se usó:     GITHUB_TOKEN de ${GITHUB_REPOSITORY} con permissions.packages=write"
+            echo "Devolvió:"
+            printf '%s\n' "${out}" | sed 's/^/  /'
+            echo ""
+            echo "Qué significa: GitHub otorga el rol \`admin\` sobre un paquete al repo"
+            echo "cuyo workflow lo publicó. Si esta llamada da 403 o 404, este repo NO"
+            echo "tiene ese rol sobre ${first} — o el paquete lo publicó otra cosa, o"
+            echo "el vínculo paquete↔repo se perdió."
+            echo ""
+            echo "NO es un permiso de la App ni un secret faltante: este camino no usa"
+            echo "ninguna credencial de organización. Se revisa en la página del"
+            echo "paquete → Package settings → Manage Actions access."
+          } >&2
+          exit 1
 
       - name: Plan (y borrado, si no es dry-run)
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ORG: ${{ github.repository_owner }}
-          # El schedule corre SIEMPRE en dry-run mientras esta expresión esté
-          # así: el borrado real se dispara a mano, mirando el plan primero.
-          # Para automatizarlo, cambiar por `${{ inputs.dry-run || 'false' }}`
-          # en un PR aparte — que es donde se discute esa decisión, no acá.
-          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
-          KEEP: ${{ inputs.keep || '3' }}
-          ONLY_PACKAGE: ${{ inputs.package || '' }}
-          MAX_DELETES: ${{ inputs.max-deletes || '500' }}
+          # El default sigue siendo dry-run, igual que antes: el borrado real se
+          # pide explícitamente. Que esa decisión se automatice o no es un
+          # debate aparte y no se resuelve en este PR — acá sólo cambió QUIÉN
+          # corre la poda y con qué credencial, no cuándo borra.
+          DRY_RUN: ${{ inputs.dry-run }}
+          KEEP: ${{ inputs.keep }}
+          PACKAGES: ${{ inputs.packages }}
+          MAX_DELETES: ${{ inputs.max-deletes }}
         run: |
           set -euo pipefail
 
@@ -178,12 +239,15 @@ jobs:
           echo "tags protegidos: ${PROTECTED_RE}"
           echo ""
 
-          if [ -n "${ONLY_PACKAGE}" ]; then
-            packages="${ONLY_PACKAGE}"
-          else
-            packages=$(gh api --paginate \
-              "/orgs/${ORG}/packages?package_type=container&per_page=100" -q '.[].name')
-          fi
+          # Los nombres vienen del descriptor de este repo, NO de listar la
+          # org: leído con GITHUB_TOKEN, `.repository` del paquete vuelve null,
+          # así que la pertenencia no se puede descubrir por la API. Ver la
+          # cabecera, "CÓMO SE SABE QUÉ PAQUETES SON MÍOS".
+          # `pkg_names` y no `packages`: shellcheck lee la minúscula al lado de
+          # la mayúscula del env y avisa SC2153 ("possible misspelling"). Es
+          # falso positivo — PACKAGES viene por `env:` — pero la confusión que
+          # detecta es real para quien lea el script.
+          pkg_names=$(printf '%s' "${PACKAGES}" | jq -r '.[]')
 
           planned=0
           deleted=0
@@ -285,7 +349,7 @@ jobs:
               # castiga las ráfagas, y acá la primera corrida real son miles.
               sleep 1
             done < <(jq -r '.[] | select(.keep | not) | .id' <<<"${plan}")
-          done <<<"${packages}"
+          done <<<"${pkg_names}"
 
           {
             echo "## GHCR retention"
