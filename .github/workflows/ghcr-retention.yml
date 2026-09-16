@@ -1,0 +1,263 @@
+# ──────────────────────────────────────────────
+# GHCR retention — se conservan los últimos N releases por paquete
+#
+# La org tiene 27 paquetes de contenedor y NUNCA se borró una versión: 2.787 al
+# escribir esto (resuelto-api sola tiene 444, la más vieja del 30 de junio).
+# Las imágenes de backend pesan 70-119 MB y las de frontend 20-24 MB: son
+# decenas de GB que crecen con cada release. Los runners self-hosted no ayudan
+# acá — ahorran minutos de cómputo, no almacenamiento; los bytes viven en
+# GitHub igual.
+#
+# Las PRs NO construyen imágenes (el job `build-images` de app-release.yml
+# exige `needs.version.outputs.bumped == 'true'`), así que no hay basura de PR
+# que barrer: cada versión de GHCR es un release real, con sus tres tags
+# (`v<version>`, el `<sha>` y `latest`).
+#
+# ── LA REGLA ──────────────────────────────────
+#
+# Se borra toda versión SALVO:
+#   (a) las últimas N por fecha de creación (N = `keep`, default 3), y
+#   (b) cualquiera que lleve un TAG DE ENTORNO: `latest`, `stable` (el canal de
+#       prod) o `<env>-stable` (`qa-stable`, `monitor-stable`).
+#
+# (b) es lo que hace que el borrado sea seguro POR DISEÑO, y no por confiar en
+# que los entornos estén al día. Prod y QA comparten el mismo repositorio de
+# imágenes: si QA hace diez releases mientras prod se queda atrás, borrar por
+# cantidad elimina la imagen que prod está corriendo, y no se nota hasta el día
+# que haya que recrear el contenedor, rebuildear el host o hacer un rollback.
+# No es hipotético — al escribir esto:
+#
+#   noten-api     prod corre v1.24.0 (2026-07-23), 55 releases atrás
+#   resuelto-api  prod corre v2.19.0 (2026-07-24), ~90 releases atrás
+#   idachu-api    prod corre v1.1.0  (2026-07-04)
+#
+# Las tres sobreviven sólo por su tag `stable`. Este workflow no sabe nada de
+# droplets ni de despliegues: lee tags, y quien despliega es quien los pone.
+#
+# Los tags de entorno los pushean dos lugares, a propósito los dos:
+#   - app-release.yml, paso "Tag as <deploy-env>-stable", tras un deploy de
+#     release verde;
+#   - infra/scripts/deploy-service.sh (`tag_env_channel`), desde el droplet,
+#     después del healthcheck y del smoke — el único camino que cubre también
+#     el deploy a mano y el del dashboard.
+#
+# ── POR QUÉ NO `actions/delete-package-versions` ──
+#
+# Su input `ignore-versions` es una regex sobre el NOMBRE de la versión, y para
+# un paquete de contenedor el nombre es el digest (`sha256:46f9303b…`), no los
+# tags. O sea que no puede expresar la condición (b), que es justamente la que
+# hace seguro el borrado. El resto de la action (contar y borrar) es trivial
+# con `gh api`; la parte que no sabe hacer es la que importa.
+#
+# ── PERMISOS ──────────────────────────────────
+#
+# `DELETE /orgs/{org}/packages/container/{pkg}/versions/{id}` exige permiso de
+# admin sobre EL PAQUETE. El `GITHUB_TOKEN` de este repo sólo alcanza a los
+# paquetes ligados a ESTE repo, y los 27 son de otros repos: no sirve. Por eso
+# el job usa el token de la App de la org (`SEMANTIC_RELEASE_APP_ID` +
+# `SEMANTIC_RELEASE_PRIVATE_KEY`, ya presentes como secrets de organización y
+# ya usados por app-release.yml / lib-release.yml / docs-publish.yml), que hay
+# que instalar con permiso de organización **Packages: write**.
+#
+# Si a la App todavía no se le otorgó ese permiso, el preflight de abajo corta
+# el job con el mensaje exacto de qué conceder. NO se inventa un secret nuevo:
+# si se decide ir por un PAT clásico con `delete:packages` en vez de la App, se
+# cambia acá y se documenta en el mismo lugar.
+# ──────────────────────────────────────────────
+name: GHCR retention
+
+on:
+  schedule:
+    # Lunes 05:00 UTC (02:00 ART): fuera de la ventana de releases y deploys.
+    # Semanal alcanza — el crecimiento es de decenas de versiones por semana,
+    # no por hora, y diario sería ruido en la lista de runs.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Sólo imprimir el plan, sin borrar nada. Empezá siempre por acá.'
+        type: boolean
+        default: true
+      keep:
+        description: 'Cuántas versiones conservar por fecha, además de las que lleven tag de entorno.'
+        type: string
+        default: '3'
+      package:
+        description: 'Limitar a un paquete (ej. noten-api). Vacío = los 27.'
+        type: string
+        default: ''
+      max-deletes:
+        description: 'Cota de borrados por corrida (la próxima sigue donde quedó). 0 = sin cota.'
+        type: string
+        default: '500'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-retention
+  cancel-in-progress: false
+
+jobs:
+  retention:
+    name: plan + borrado de versiones viejas
+    # NO usar `[self-hosted, linux, x64, skylabs]`. Mismo razonamiento que
+    # ci.yml: este es el único repo PÚBLICO de la org, y acá encima el job
+    # sostiene una credencial que puede borrar imágenes de toda la flota. El
+    # pool self-hosted es un host persistente compartido con `provision-env`,
+    # `operators` y el deploy de prod. Este job sólo habla con la API de
+    # GitHub: una VM descartable es lo correcto, y en un repo público no
+    # consume minutos.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # El token de la App: efímero, de organización, sin PAT largo dando vueltas.
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Falla temprano y con nombre y apellido: sin esto, la falta de permiso
+      # aparecería como un 403 a mitad del borrado, con parte del plan aplicado.
+      - name: Preflight — el token puede leer los paquetes de la org
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if ! gh api "/orgs/${ORG}/packages?package_type=container&per_page=1" >/dev/null 2>&1; then
+            echo "::error::El token no puede listar los paquetes de ${ORG}."
+            echo "Otorgale a la App semantic-release-bot-skylabs el permiso de" >&2
+            echo "organización 'Packages' en nivel write (incluye delete), o cambiá" >&2
+            echo "este workflow para usar un PAT clásico con read:packages +" >&2
+            echo "delete:packages. El GITHUB_TOKEN de este repo NO sirve: sólo" >&2
+            echo "alcanza a los paquetes ligados a este repo." >&2
+            exit 1
+          fi
+          echo "OK — el token lee los paquetes de la org."
+
+      - name: Plan (y borrado, si no es dry-run)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          # El schedule corre SIEMPRE en dry-run mientras esta expresión esté
+          # así: el borrado real se dispara a mano, mirando el plan primero.
+          # Para automatizarlo, cambiar por `${{ inputs.dry-run || 'false' }}`
+          # en un PR aparte — que es donde se discute esa decisión, no acá.
+          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+          KEEP: ${{ inputs.keep || '3' }}
+          ONLY_PACKAGE: ${{ inputs.package || '' }}
+          MAX_DELETES: ${{ inputs.max-deletes || '500' }}
+        run: |
+          set -euo pipefail
+
+          # (b): un tag de entorno vuelve INTOCABLE a la versión que lo lleva,
+          # por vieja que sea. `stable` es el canal de prod (el nombre que el
+          # deploy-dashboard tiene hardcodeado); `<env>-stable` es el de los
+          # demás entornos.
+          PROTECTED_RE='^(latest|stable|[a-z0-9]([a-z0-9-]*[a-z0-9])?-stable)$'
+
+          echo "keep=${KEEP}  dry-run=${DRY_RUN}  max-deletes=${MAX_DELETES}"
+          echo "tags protegidos: ${PROTECTED_RE}"
+          echo ""
+
+          if [ -n "${ONLY_PACKAGE}" ]; then
+            packages="${ONLY_PACKAGE}"
+          else
+            packages=$(gh api --paginate \
+              "/orgs/${ORG}/packages?package_type=container&per_page=100" -q '.[].name')
+          fi
+
+          planned=0
+          deleted=0
+          capped=0
+          rows=""
+
+          while IFS= read -r pkg; do
+            [ -n "${pkg}" ] || continue
+            # Dos paquetes llevan '/' en el nombre (loving.wedding/frontend y
+            # /backend) y la API los quiere url-encodeados.
+            enc=$(printf '%s' "${pkg}" | sed 's|/|%2F|g')
+
+            versions=$(gh api --paginate \
+              "/orgs/${ORG}/packages/container/${enc}/versions?per_page=100" \
+              -q '.[] | {id, created_at, tags: (.metadata.container.tags // [])}' | jq -s '.')
+
+            plan=$(jq -c --argjson keep "${KEEP}" --arg re "${PROTECTED_RE}" '
+              sort_by(.created_at) | reverse
+              | to_entries
+              | map(.value + {
+                  protected: ([.value.tags[]? | select(test($re))] | length > 0),
+                  recent: (.key < $keep)
+                })
+              | map(. + {keep: (.protected or .recent)})
+            ' <<<"${versions}")
+
+            n=$(jq 'length' <<<"${plan}")
+            n_keep=$(jq '[.[] | select(.keep)] | length' <<<"${plan}")
+            n_del=$(( n - n_keep ))
+
+            echo "── ${pkg}: ${n} versiones → conservar ${n_keep}, borrar ${n_del}"
+            jq -r '.[] | select(.keep)
+              | "   KEEP    \(.id)  \(.created_at)  [\(.tags | join(", "))]" +
+                (if .protected then "  ← tag de entorno" else "" end)' <<<"${plan}"
+
+            # ── PISO DE SEGURIDAD ──
+            # Un bug en el filtro no puede vaciar el registry: si el plan
+            # borrara TODO, o dejara menos de `keep` versiones habiendo más,
+            # el job falla y no borra nada de nadie.
+            floor=$(( n < KEEP ? n : KEEP ))
+            if [ "${n_del}" -gt 0 ] && { [ "${n_keep}" -lt "${floor}" ] || [ "${n_del}" -eq "${n}" ]; }; then
+              echo "::error::${pkg}: el plan dejaría ${n_keep}/${n} versiones (piso ${floor}). Abortando sin borrar."
+              exit 1
+            fi
+
+            if [ "${n_del}" -eq 0 ]; then
+              rows="${rows}| \`${pkg}\` | ${n} | ${n_keep} | 0 |"$'\n'
+              continue
+            fi
+
+            jq -r '.[] | select(.keep | not)
+              | "   DELETE  \(.id)  \(.created_at)  [\(.tags | join(", "))]"' <<<"${plan}"
+            planned=$(( planned + n_del ))
+            rows="${rows}| \`${pkg}\` | ${n} | ${n_keep} | ${n_del} |"$'\n'
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              continue
+            fi
+
+            while IFS= read -r id; do
+              [ -n "${id}" ] || continue
+              if [ "${MAX_DELETES}" != "0" ] && [ "${deleted}" -ge "${MAX_DELETES}" ]; then
+                capped=1
+                break
+              fi
+              gh api --method DELETE --silent \
+                "/orgs/${ORG}/packages/container/${enc}/versions/${id}"
+              deleted=$(( deleted + 1 ))
+              # Los borrados son escrituras: el límite secundario de la API
+              # castiga las ráfagas, y acá la primera corrida real son miles.
+              sleep 1
+            done < <(jq -r '.[] | select(.keep | not) | .id' <<<"${plan}")
+          done <<<"${packages}"
+
+          {
+            echo "## GHCR retention"
+            echo ""
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "**DRY RUN** — no se borró nada. Plan: **${planned}** versiones."
+            else
+              echo "Borradas: **${deleted}** de **${planned}** planeadas."
+              [ "${capped}" = "1" ] && echo ""
+              [ "${capped}" = "1" ] && echo "> Cortado por \`max-deletes=${MAX_DELETES}\`; la próxima corrida sigue donde quedó."
+            fi
+            echo ""
+            echo "Regla: conservar las últimas \`${KEEP}\` por fecha **+** toda versión con tag de entorno (\`latest\`, \`stable\`, \`<env>-stable\`)."
+            echo ""
+            echo "| paquete | versiones | conservadas | a borrar |"
+            echo "|---|---:|---:|---:|"
+            printf '%s' "${rows}"
+          } >> "${GITHUB_STEP_SUMMARY}"
