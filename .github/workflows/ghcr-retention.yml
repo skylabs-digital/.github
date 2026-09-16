@@ -243,7 +243,11 @@ jobs:
           # org: leído con GITHUB_TOKEN, `.repository` del paquete vuelve null,
           # así que la pertenencia no se puede descubrir por la API. Ver la
           # cabecera, "CÓMO SE SABE QUÉ PAQUETES SON MÍOS".
-          packages=$(printf '%s' "${PACKAGES}" | jq -r '.[]')
+          # `pkg_names` y no `packages`: shellcheck lee la minúscula al lado de
+          # la mayúscula del env y avisa SC2153 ("possible misspelling"). Es
+          # falso positivo — PACKAGES viene por `env:` — pero la confusión que
+          # detecta es real para quien lea el script.
+          pkg_names=$(printf '%s' "${PACKAGES}" | jq -r '.[]')
 
           planned=0
           deleted=0
@@ -345,7 +349,7 @@ jobs:
               # castiga las ráfagas, y acá la primera corrida real son miles.
               sleep 1
             done < <(jq -r '.[] | select(.keep | not) | .id' <<<"${plan}")
-          done <<<"${packages}"
+          done <<<"${pkg_names}"
 
           {
             echo "## GHCR retention"
