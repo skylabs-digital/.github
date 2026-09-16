@@ -103,6 +103,15 @@ on:
         description: 'JSON array of runner labels'
         type: string
         default: '["self-hosted","linux","x64","skylabs"]'
+      prune-images:
+        description: >
+          true → la poda de GHCR BORRA de verdad. El default es `false`, que
+          corre igual y publica el plan en el resumen del job sin tocar nada,
+          para que el efecto se lea antes de habilitarlo. La regla y sus
+          resguardos están en ghcr-retention.yml; automatizar el borrado en
+          toda la flota es una decisión aparte de la de este input.
+        type: boolean
+        default: false
       deploy:
         description: >
           false → el pipeline hace TODO menos desplegar: CI, versión, imagen,
@@ -945,6 +954,29 @@ jobs:
   # inalcanzable sin el evento, y `matrix`/`static-checks`/`security`/`version`
   # no cambiaron para ningún otro evento.
   # ============================================================
+  # La poda corre en ESTE repo, no en `.github`: su GITHUB_TOKEN alcanza los
+  # paquetes que este repo publicó, y ninguna credencial de organización hace
+  # falta. La versión centralizada nunca funcionó — ver la cabecera de
+  # ghcr-retention.yml.
+  #
+  # Va después del deploy y no antes: recién ahí existe la imagen nueva y la
+  # vieja pasa a ser podable. Y con las mismas condiciones que `cac-apply`, que
+  # es el otro job que sólo tiene sentido tras un release verde.
+  ghcr-retention:
+    name: Poda de imágenes viejas (GHCR)
+    needs: [version, matrix, deploy]
+    if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
+    uses: skylabs-digital/.github/.github/workflows/ghcr-retention.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      # Los nombres de imagen salen del descriptor, vía el mismo `sl app
+      # services` que alimenta la matriz de build: lo que este repo construye es
+      # exactamente lo que este repo puede podar.
+      packages: ${{ toJson(fromJson(needs.matrix.outputs.services).*.name) }}
+      dry-run: ${{ !inputs.prune-images }}
+
   secrets-rotate:
     name: Secrets rotate (recipients del registro)
     if: github.event_name == 'repository_dispatch' && github.event.action == 'skylabs-operators-changed'
