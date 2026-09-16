@@ -690,12 +690,22 @@ jobs:
   # skylabs/docs/standards/skylabs-cac.md §7. Opt-in by presence of
   # `cac/stack.ts` in the repo: nothing changes for repos without it.
   #
-  # PR   → `yarn cac plan --env <deploy-env>`: the diff against the platform
-  #        catalog, exit 1 on orphans/rejections so the PR shows drift.
-  # main → `yarn cac apply --env <deploy-env> --no-create-keys`, after the
+  # PR   → `yarn sl cac plan --env <deploy-env>`: the diff against the platform
+  #        catalog, so the PR shows drift.
+  # main → `yarn sl cac apply --env <deploy-env> --no-create-keys`, after the
   #        migrations and the deploy of every service: the code is live before
   #        the catalog (roles, flags, templates) is aligned to it. Keys are
   #        created by a person (a local apply), never by CI.
+  #
+  # The entry point is `sl` (`@skylabs-digital/cli`, pinned by each repo), NOT
+  # a `cac` script of the repo's own: `@skylabs-digital/cac` 2.0.0 dropped its
+  # binary and stayed a library, so `yarn cac` no longer resolves anywhere.
+  # Every repo with a `cac/stack.ts` therefore needs `@skylabs-digital/cli` in
+  # devDependencies and an `"sl": "sl"` script (docs/standards/sl-en-los-repos.md).
+  #
+  # `sl` exits 2 for findings — a plan with changes or orphans, an apply that
+  # leaves orphans — which is not a failure. Both steps annotate those and stay
+  # green; only exit 1 reddens the job. See the comments on each step.
   #
   # Credentials come from the GitHub Environment named after deploy-env:
   # vars IDACHU_URL / NOTEN_URL / FISTO_URL (one <PREFIX>_URL per provider the
@@ -705,11 +715,6 @@ jobs:
   # IDACHU_CAC_KEY for a service token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
-  #
-  # SEGUIMIENTO (bead sl-0fl.2): cuando `sl cac` esté publicado (plan `sl cac`
-  # merged y `@skylabs-digital/cli` lo expone), cambiar las dos invocaciones de
-  # `yarn cac` por `yarn sl cac` en `cac-plan` y `cac-apply`. Hoy `cli` 1.3.0
-  # trae `sl deploy` y `sl app services`; `sl cac` todavía no.
   # ============================================================
   cac-plan:
     name: CaC plan (${{ inputs.deploy-env }})
@@ -741,7 +746,7 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      - name: yarn cac plan --env ${{ inputs.deploy-env }}
+      - name: yarn sl cac plan --env ${{ inputs.deploy-env }}
         if: steps.stack.outputs.present == 'true'
         env:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
@@ -753,7 +758,19 @@ jobs:
             echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped."
             exit 0
           fi
-          yarn cac plan --env "${{ inputs.deploy-env }}"
+          # `sl` exits 2 for "findings": a plan WITH changes, orphans included.
+          # That is the normal state of a PR that touches cac/stack.ts, so it
+          # annotates and stays green — the diff is in the log, to be read
+          # before merging. Only a real failure (1) reddens the job.
+          set +e
+          yarn sl cac plan --env "${{ inputs.deploy-env }}"
+          code=$?
+          set -e
+          if [ "${code}" -eq 2 ]; then
+            echo "::warning::CaC plan for '${{ inputs.deploy-env }}' has changes (or orphans). Read the diff above before merging."
+            exit 0
+          fi
+          exit "${code}"
 
   cac-apply:
     name: CaC apply (${{ inputs.deploy-env }})
@@ -796,7 +813,7 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      - name: yarn cac apply --env ${{ inputs.deploy-env }} --no-create-keys
+      - name: yarn sl cac apply --env ${{ inputs.deploy-env }} --no-create-keys
         if: steps.stack.outputs.present == 'true'
         env:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
@@ -808,7 +825,20 @@ jobs:
             echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
             exit 0
           fi
-          yarn cac apply --env "${{ inputs.deploy-env }}" --no-create-keys
+          # Exit 2 here means the apply worked but left orphans: resources the
+          # stack no longer declares. It is a finding, not a failure, and this
+          # job runs AFTER the deploy — reddening the release once the images
+          # are already out would say "the release broke" about something that
+          # did not. It annotates instead; the orphans get cleaned in a PR.
+          set +e
+          yarn sl cac apply --env "${{ inputs.deploy-env }}" --no-create-keys
+          code=$?
+          set -e
+          if [ "${code}" -eq 2 ]; then
+            echo "::warning::CaC apply for '${{ inputs.deploy-env }}' left orphans. Read the list above and clean them in a PR."
+            exit 0
+          fi
+          exit "${code}"
 
   # ============================================================
   # STAGE 6 — SECRETS ROTATE — reacciona al alta/baja de un operador
