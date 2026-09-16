@@ -136,7 +136,7 @@ on:
         value: ${{ jobs.version.outputs.bumped }}
     secrets:
       GHCR_TOKEN:
-        description: 'Classic PAT (read:packages + write:packages) for private npm + GHCR docker login, and sparse checkout of skylabs-digital/infra when INFRA_READ_TOKEN is not set'
+        description: 'Classic PAT (read:packages + write:packages) for private npm installs and the GHCR docker login. NOT for cloning repositories: read:packages cannot check out a private repo, so the registry checkout uses a GitHub App token instead.'
         required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'GitHub App id for semantic-release-bot-skylabs (mints git-push token)'
@@ -158,11 +158,6 @@ on:
           Clave age de CI de la FLOTA (identidad ci-github-actions), secret de organización.
           Descifra deploy/secrets/<env>.env de la app. Sin ella, `sl deploy` no puede escribir
           el env de la app en el droplet.
-        required: false
-      INFRA_READ_TOKEN:
-        description: >-
-          Secret de organización, sólo lectura de skylabs-digital/infra (sparse checkout de
-          registry/ para SL_REGISTRY). Falla hacia GHCR_TOKEN si todavía no existe.
         required: false
 
 # husky must not run on the runner. Since the fleet moved hooks to
@@ -598,15 +593,30 @@ jobs:
 
       # El registro de la plataforma: sparse checkout de infra, sólo registry/.
       # Es de dónde salen el bastión, las IPs privadas y los recipients age.
-      # INFRA_READ_TOKEN (secret de organización, sólo lectura de infra) es
-      # preferido; GHCR_TOKEN es el fallback hasta que Fer lo cree.
+      # El token sale de la App y dura una hora. Antes salía de INFRA_READ_TOKEN,
+      # un PAT clásico con scope `repo` — o sea ESCRITURA en los 41 repos
+      # privados — para leer un directorio. Su fallback declarado, GHCR_TOKEN,
+      # no podía funcionar: tiene `read:packages` y con eso no se checkoutea un
+      # repo privado. Nunca se notó porque INFRA_READ_TOKEN siempre estaba.
+      - name: Token para leer el registro
+        id: registry-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
+          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
+          # ESCRIBIR en los 41 repos privados de la org.
+          repositories: infra
+
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
-          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
+          token: ${{ steps.registry-token.outputs.token }}
 
       - name: Install sops (pinned + checksum)
         # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
@@ -782,6 +792,19 @@ jobs:
       # descriptor necesita el registro: no lee `<PREFIJO>_URL` del entorno
       # como hacía el `cac` 1.6 (skylabs-cac.md §7). Mismo patrón y mismo
       # `path:` que el job `deploy`.
+      - name: Token para leer el registro
+        id: registry-token
+        if: steps.stack.outputs.present == 'true'
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
+          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
+          # ESCRIBIR en los 41 repos privados de la org.
+          repositories: infra
+
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -789,7 +812,7 @@ jobs:
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
-          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
+          token: ${{ steps.registry-token.outputs.token }}
       - name: yarn sl cac plan --env ${{ inputs.deploy-env }}
         if: steps.stack.outputs.present == 'true'
         env:
@@ -891,6 +914,19 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
       # Mismo motivo y mismo patrón que en `cac-plan`: `sl cac` deriva la URL
       # del provider del descriptor, y para eso necesita el registro.
+      - name: Token para leer el registro
+        id: registry-token
+        if: steps.stack.outputs.present == 'true'
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
+          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
+          # ESCRIBIR en los 41 repos privados de la org.
+          repositories: infra
+
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -898,7 +934,7 @@ jobs:
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
-          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
+          token: ${{ steps.registry-token.outputs.token }}
       - name: yarn sl cac apply --env ${{ inputs.deploy-env }} --no-create-keys
         if: steps.stack.outputs.present == 'true'
         env:
@@ -1032,10 +1068,9 @@ jobs:
 
       # Sólo el registro: un checkout sparse de infra, no el repo entero.
       # Mismo `path: .infra-registry` que el job `deploy`, para que el nombre no
-      # dependa del job. El TOKEN sí es distinto a propósito: a `deploy` le
-      # alcanza con INFRA_READ_TOKEN (sólo lectura de infra) y acá hace falta el
-      # del App, que además es el único que puede pushear a la rama protegida de
-      # la app.
+      # dependa del job. Desde 2026-09-16 TODOS los checkouts del registro usan
+      # un token de la App; éste está acotado a `<repo>,infra` y no sólo a
+      # `infra` porque el mismo token pushea a la rama protegida de la app.
       - name: Checkout del registro de la plataforma
         if: steps.secretos.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
