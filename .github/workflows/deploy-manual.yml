@@ -125,8 +125,11 @@ on:
       SOPS_AGE_KEY:
         description: 'Clave age de CI de la flota (identidad ci-github-actions). Descifra deploy/secrets/<env>.env'
         required: false
-      INFRA_READ_TOKEN:
-        description: 'Secret de organización, sólo lectura de skylabs-digital/infra (sparse checkout de registry/). Cae a GHCR_TOKEN'
+      SEMANTIC_RELEASE_APP_ID:
+        description: 'GitHub App client id. Acuña el token efímero con el que se checkoutea el registro de la plataforma (sparse de skylabs-digital/infra, sólo registry/)'
+        required: false
+      SEMANTIC_RELEASE_PRIVATE_KEY:
+        description: 'GitHub App private key matching SEMANTIC_RELEASE_APP_ID'
         required: false
 
 # Mismo motivo que en app-release.yml: con los hooks en `postinstall`,
@@ -227,14 +230,24 @@ jobs:
 
       # El registro de la plataforma: sparse checkout de infra, sólo registry/.
       # De ahí salen el bastión, las IPs privadas y los recipients age.
-      # Idéntico al job `deploy` de app-release.yml, mismo `path`.
+      # Idéntico al job `deploy` de app-release.yml, mismo `path` y mismo token.
+      - name: Token para leer el registro
+        id: registry-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
+          repositories: infra
+
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
-          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
+          token: ${{ steps.registry-token.outputs.token }}
 
       - name: Install sops (pinned + checksum)
         # Mismo pin y mismo checksum que app-release.yml y que
