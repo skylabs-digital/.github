@@ -34,6 +34,14 @@
 # Las tres sobreviven sólo por su tag `stable`. Este workflow no sabe nada de
 # droplets ni de despliegues: lee tags, y quien despliega es quien los pone.
 #
+# Corolario de (b): un paquete donde NINGUNA versión lleva tag de entorno no se
+# toca. Ahí (b) no existe, y el estado tiene dos lecturas indistinguibles desde
+# acá — nunca se desplegó, o el tagueo (best-effort) viene fallando callado. Se
+# saltea con un `::warning::` que lo nombra y lo decide una persona. El resumen
+# lleva la cuenta de salteados: si sube, es el canario de que el tagueo se
+# rompió. Hoy son tres, los tres legacy sin fragmento de compose que los
+# referencie: kommi-frontend, loving.wedding/frontend y loving.wedding/backend.
+#
 # Los tags de entorno los pushean dos lugares, a propósito los dos:
 #   - app-release.yml, paso "Tag as <deploy-env>-stable", tras un deploy de
 #     release verde;
@@ -174,6 +182,7 @@ jobs:
           planned=0
           deleted=0
           capped=0
+          skipped=0
           rows=""
 
           while IFS= read -r pkg; do
@@ -199,11 +208,39 @@ jobs:
             n=$(jq 'length' <<<"${plan}")
             n_keep=$(jq '[.[] | select(.keep)] | length' <<<"${plan}")
             n_del=$(( n - n_keep ))
+            n_prot=$(jq '[.[] | select(.protected)] | length' <<<"${plan}")
 
             echo "── ${pkg}: ${n} versiones → conservar ${n_keep}, borrar ${n_del}"
             jq -r '.[] | select(.keep)
               | "   KEEP    \(.id)  \(.created_at)  [\(.tags | join(", "))]" +
                 (if .protected then "  ← tag de entorno" else "" end)' <<<"${plan}"
+
+            # ── GUARDA: un paquete sin NINGÚN tag de entorno no se toca ──
+            # Toda la seguridad de este workflow descansa en la condición (b), y
+            # (b) no existe para un paquete donde ninguna versión lleva tag de
+            # entorno. Ese estado tiene DOS lecturas que desde acá no se pueden
+            # distinguir, y una de las dos es cara:
+            #
+            #   1. nunca se desplegó a ningún entorno   → borrar es seguro;
+            #   2. el tagueo viene fallando en silencio → borrar se lleva puesta
+            #      la imagen que un entorno está corriendo.
+            #
+            # La (2) no es teórica: `tag_env_channel` (infra/deploy-service.sh) es
+            # best-effort A PROPÓSITO — un fallo al pushear el tag sólo warnea y
+            # el deploy sigue verde, que es lo correcto para el deploy y
+            # justamente lo que deja este agujero. Y el costo de equivocarse es
+            # el de prod corriendo noten-api v1.24.0, 55 releases atrás.
+            #
+            # Así que se saltea y lo decide una persona: o es legacy y se borra
+            # el paquete entero a mano, o es un tagueo roto y se arregla. Tres
+            # paquetes muertos ocupando espacio salen mucho más baratos que una
+            # imagen viva borrada.
+            if [ "${n_prot}" -eq 0 ]; then
+              echo "::warning::${pkg}: ninguna de sus ${n} versiones lleva tag de entorno — se saltea. O nunca se desplegó (legacy: borralo a mano) o el tagueo de deploy está fallando (arreglalo antes de que la retención lo alcance)."
+              skipped=$(( skipped + 1 ))
+              rows="${rows}| \`${pkg}\` | ${n} | ${n} | — salteado |"$'\n'
+              continue
+            fi
 
             # ── PISO DE SEGURIDAD ──
             # Un bug en el filtro no puede vaciar el registry: si el plan
@@ -256,6 +293,11 @@ jobs:
             fi
             echo ""
             echo "Regla: conservar las últimas \`${KEEP}\` por fecha **+** toda versión con tag de entorno (\`latest\`, \`stable\`, \`<env>-stable\`)."
+            echo ""
+            # Esta línea es el canario de `tag_env_channel`: si el número sube,
+            # o hay un paquete nuevo que nunca se desplegó, o el tagueo de
+            # deploy empezó a fallar en silencio (es best-effort).
+            echo "Paquetes **salteados** por no tener ninguna versión con tag de entorno: **${skipped}**."
             echo ""
             echo "| paquete | versiones | conservadas | a borrar |"
             echo "|---|---:|---:|---:|"
