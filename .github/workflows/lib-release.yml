@@ -296,7 +296,10 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          # SIN `owner:` a propósito: sin él la action acota el token al repo
+          # actual, que es lo único que este job toca (checkout, bump y push de
+          # la lib). Con `owner` saldría con acceso a los 41 repos de la org.
+          # Ver skylabs/docs/runbooks/apps-y-credenciales-de-la-org.md §1.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           token: ${{ steps.app-token.outputs.token }}

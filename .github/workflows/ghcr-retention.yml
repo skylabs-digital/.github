@@ -138,11 +138,17 @@ jobs:
           set -euo pipefail
           if ! gh api "/orgs/${ORG}/packages?package_type=container&per_page=1" >/dev/null 2>&1; then
             echo "::error::El token no puede listar los paquetes de ${ORG}."
-            echo "Otorgale a la App semantic-release-bot-skylabs el permiso de" >&2
-            echo "organización 'Packages' en nivel write (incluye delete), o cambiá" >&2
-            echo "este workflow para usar un PAT clásico con read:packages +" >&2
-            echo "delete:packages. El GITHUB_TOKEN de este repo NO sirve: sólo" >&2
-            echo "alcanza a los paquetes ligados a este repo." >&2
+            echo "NO es falta de permiso: la App semantic-release-bot-skylabs ya" >&2
+            echo "tiene 'packages: write'. Ese es un permiso de REPOSITORIO y" >&2
+            echo "/orgs/{org}/packages es un endpoint de ORGANIZACIÓN, que un" >&2
+            echo "installation token no alcanza. Verificado por diferencia: un PAT" >&2
+            echo "lista los paquetes de la org; el token de la App no, con el" >&2
+            echo "permiso puesto. Agregarle permisos en Settings no cambia nada." >&2
+            echo "" >&2
+            echo "El arreglo es de diseño, no de credencial: los 27 paquetes están" >&2
+            echo "LIGADOS a su repo, así que cada repo puede podar los suyos con su" >&2
+            echo "propio GITHUB_TOKEN y no hace falta credencial de organización." >&2
+            echo "Ver skylabs/docs/runbooks/apps-y-credenciales-de-la-org.md §4." >&2
             exit 1
           fi
           echo "OK — el token lee los paquetes de la org."
