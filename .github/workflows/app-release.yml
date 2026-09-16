@@ -704,8 +704,16 @@ jobs:
   # devDependencies and an `"sl": "sl"` script (docs/standards/sl-en-los-repos.md).
   #
   # `sl` exits 2 for findings — a plan with changes or orphans, an apply that
-  # leaves orphans — which is not a failure. Both steps annotate those and stay
-  # green; only exit 1 reddens the job. See the comments on each step.
+  # leaves orphans — which is not a failure per se. `cac-plan` therefore looks
+  # at the payload, not the code: a plain diff annotates and stays green, an
+  # ORPHAN reddens the PR and is named (skylabs-cac.md §7). `cac-apply` only
+  # annotates: it runs after the deploy, and an orphan is a leftover resource,
+  # not a broken release. See the comments on each step.
+  #
+  # Both jobs sparse-checkout `skylabs-digital/infra` for `registry/` and export
+  # SL_REGISTRY: `sl cac` derives each provider's URL from `exports.<env>.URL`
+  # of that app's descriptor and needs the registry to find it. It does NOT read
+  # `<PREFIJO>_URL` from the environment the way `cac` 1.6 did.
   #
   # Credentials come from the GitHub Environment named after deploy-env:
   # vars IDACHU_URL / NOTEN_URL / FISTO_URL (one <PREFIX>_URL per provider the
@@ -746,6 +754,19 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      # El registro de la plataforma. `sl cac` DERIVA la URL de cada provider
+      # de `exports.<env>.URL` del descriptor de esa app, y para llegar al
+      # descriptor necesita el registro: no lee `<PREFIJO>_URL` del entorno
+      # como hacía el `cac` 1.6 (skylabs-cac.md §7). Mismo patrón y mismo
+      # `path:` que el job `deploy`.
+      - name: Checkout del registro (sparse)
+        if: steps.stack.outputs.present == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: skylabs-digital/infra
+          path: .infra-registry
+          sparse-checkout: registry
+          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: yarn sl cac plan --env ${{ inputs.deploy-env }}
         if: steps.stack.outputs.present == 'true'
         env:
@@ -753,24 +774,53 @@ jobs:
           NOTEN_URL: ${{ vars.NOTEN_URL }}
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
         run: |
           if [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped."
             exit 0
           fi
-          # `sl` exits 2 for "findings": a plan WITH changes, orphans included.
-          # That is the normal state of a PR that touches cac/stack.ts, so it
-          # annotates and stays green — the diff is in the log, to be read
-          # before merging. Only a real failure (1) reddens the job.
+          # `sl` collapses "plan with changes" and "plan with orphans" into the
+          # same exit 2 (cli/src/cac/run.ts: "cualquier acción que no sea
+          # `noop`, huérfanos incluidos"). The two are NOT the same thing here:
+          #
+          #   skylabs-cac.md §7 — "El `plan` en PR FALLA si hay `orphan` o
+          #   rechazo."  A rejection is already exit 1. An orphan is a resource
+          #   someone changed by hand outside CaC, and it must redden the PR.
+          #
+          #   skylabs-cli.md §3 — exit 2 is Terraform's `-detailed-exitcode`:
+          #   "a plan with changes", which is NOT a failure.
+          #
+          # Both hold only if we stop reading the exit code and look at the
+          # payload, so the plan is re-run with --json and `data.orphans`
+          # decides. A plain diff stays green; an orphan fails and is NAMED.
           set +e
           yarn sl cac plan --env "${{ inputs.deploy-env }}"
           code=$?
           set -e
-          if [ "${code}" -eq 2 ]; then
-            echo "::warning::CaC plan for '${{ inputs.deploy-env }}' has changes (or orphans). Read the diff above before merging."
-            exit 0
+          [ "${code}" -ne 2 ] && exit "${code}"
+
+          plan_json="$(SL_FORMAT=json yarn sl cac plan --env "${{ inputs.deploy-env }}" --json 2>/dev/null | tail -n 1)"
+
+          # A guard that breaks quietly is worse than no guard. The type check is
+          # the point: `.data.orphans | length` on a MISSING key is null|length
+          # = 0, which jq -e accepts, so an envelope that ever stops carrying
+          # `orphans` would wave every PR through green. Demanding an array
+          # turns that into a loud failure instead.
+          if ! orphans="$(printf '%s' "${plan_json}" \
+              | jq -e -r 'if (.data.orphans | type) == "array" then (.data.orphans | length) else error("missing .data.orphans array") end' 2>/dev/null)"; then
+            echo "::error::CaC plan exited 2 but its --json envelope could not be read (expected an array at .data.orphans), so orphans could not be ruled out. Fix this guard or read the plan by hand — do not merge on a green that means nothing."
+            exit 1
           fi
-          exit "${code}"
+
+          if [ "${orphans}" -gt 0 ]; then
+            echo "::error::CaC plan for '${{ inputs.deploy-env }}': ${orphans} orphan(s) — declared nowhere in cac/stack.ts but alive with managed_by=cac, i.e. changed by hand. Re-declare them or remove them with --prune:"
+            printf '%s' "${plan_json}" | jq -r '.data.orphans[] | "  - \(.provider) \(.kind) \(.name)"'
+            exit 1
+          fi
+
+          echo "::warning::CaC plan for '${{ inputs.deploy-env }}' has changes (no orphans). Read the diff above before merging."
+          exit 0
 
   cac-apply:
     name: CaC apply (${{ inputs.deploy-env }})
@@ -813,6 +863,16 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      # Mismo motivo y mismo patrón que en `cac-plan`: `sl cac` deriva la URL
+      # del provider del descriptor, y para eso necesita el registro.
+      - name: Checkout del registro (sparse)
+        if: steps.stack.outputs.present == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: skylabs-digital/infra
+          path: .infra-registry
+          sparse-checkout: registry
+          token: ${{ secrets.INFRA_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: yarn sl cac apply --env ${{ inputs.deploy-env }} --no-create-keys
         if: steps.stack.outputs.present == 'true'
         env:
@@ -820,6 +880,7 @@ jobs:
           NOTEN_URL: ${{ vars.NOTEN_URL }}
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
         run: |
           if [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
