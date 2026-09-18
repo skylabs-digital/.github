@@ -25,24 +25,37 @@ macOS only. Do not run it with `sudo`; it refuses.
 
 Every step is idempotent: running it again reinstalls nothing.
 
-1. Checks for `brew`, `node` (24 or later), `gh`, `sops` and `age`. For anything missing it says
-   so and **asks** before installing it with brew. It does not install Homebrew itself: that
-   installer edits your shell profile, and this script never does.
+1. Checks for `brew`, `node` (24 or later), `gh`, `sops` (**3.10 or later**) and `age`. For
+   anything missing it says so and **asks** before installing it with brew; an `sops` that is
+   merely too old is offered as an upgrade, because `sl auth init` refuses to run below 3.10 —
+   that is the version from which sops can decrypt with an SSH key. It does not install Homebrew
+   itself: that installer edits your shell profile, and this script never does.
 2. `corepack enable`, which provides `yarn` (repos declare it in `packageManager`).
-3. `gh auth status`. No session: `gh auth login`. A session whose token lacks the
-   **`read:packages`** scope: `gh auth refresh -s read:packages`. This is the step nobody
-   remembers — the token `gh auth login` leaves does not include it, and without it installing
-   from GitHub Packages answers `403`.
+3. `gh auth status`. No session: `gh auth login`, asking for the two scopes the fleet needs and
+   `gh` does not grant by default. A session whose token is missing one:
+   `gh auth refresh -s <the missing one>`.
+    - **`read:packages`** — without it, installing from GitHub Packages answers `403` (step 4).
+    - **`admin:public_key`** — without it, `sl auth init` cannot upload your public key to your
+      GitHub account (step 5). On a fresh Mac the key has just been generated, so it is never
+      there yet and the upload is always attempted.
+
+   These are the two steps nobody remembers, and each one costs an afternoon.
 4. `npm install -g @skylabs-digital/cli@<pinned version>`, authenticated with the token
    `gh auth token` returns on your machine, at that moment.
-5. `sl auth init`: generates your age and SSH identities, opens the onboarding pull request
-   against the platform repo, and waits for the merge.
+5. `sl auth init`: enrolls you as an operator. Your identity is your GitHub account, your key
+   is one of your own SSH keys — `~/.ssh/id_ed25519` by default; it asks which one if you have
+   several, and generates one without a passphrase if you have none. There is no Skylabs key of
+   its own and no pull request to merge. It uploads that key to your GitHub account if it is not
+   there yet, asks infra to run the reconciler that reads the team and rewrites the registry,
+   and waits until the registry lists you and CI has re-encrypted the secrets for your key.
 
-Until that pull request is merged and CI re-encrypts the secrets for your key, **your new key
-decrypts nothing** — on purpose: otherwise anyone running `sl auth init` could read the fleet's
-secrets.
+The approval is being in the **`skylabs-digital/operators`** team. If you are not in it yet,
+`sl auth init` tells you who to ask and exits without touching anything.
 
-After the merge, each repo is one command away:
+Until the registry lists you and CI re-encrypts the secrets for your key, **your key decrypts
+nothing** — on purpose: otherwise anyone running `sl auth init` could read the fleet's secrets.
+
+Once that is done — `sl doctor` tells you — each repo is one command away:
 
 ```bash
 git clone git@github.com:skylabs-digital/<repo>.git
