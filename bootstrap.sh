@@ -14,16 +14,24 @@
 #
 #   1. Verifica que estén `brew`, `node` (>= 24), `gh`, `sops` y `age`.
 #      Lo que falte, te lo dice y te PREGUNTA antes de instalarlo con brew.
-#      `sops` tiene que ser 3.10 o más nuevo: es desde esa versión que sabe
-#      usar una clave SSH como identidad, y hoy se descifra con tu clave SSH.
+#      Con `sops` no alcanza con que esté: tiene que ser 3.10 o más nuevo, que
+#      es desde donde sabe usar una clave SSH como identidad, y hoy se descifra
+#      con tu clave SSH. Si el que tenés es más viejo, entra en la lista de lo
+#      que hay que ACTUALIZAR, igual que un node corto: si no, esta máquina
+#      pasaría verde por acá para morir recién en el paso 5.
 #      `age` ya no genera ninguna identidad tuya, pero sigue en la lista, y hay
 #      un porqué: está escrito en la sección 1 (herramientas), más abajo.
 #   2. `corepack enable` — es lo que da `yarn`; los repos lo declaran en
 #      `packageManager` y no traen yarn adentro.
-#   3. `gh auth status`. Si no hay sesión, `gh auth login`. Si la hay pero al
-#      token le falta el scope `read:packages`, `gh auth refresh -s read:packages`.
-#      Ese scope es el paso que hoy nadie sabe que existe: sin él, instalar
-#      desde GitHub Packages devuelve 403.
+#   3. `gh auth status`. Si no hay sesión, `gh auth login` pidiendo los DOS
+#      scopes que la flota necesita y que `gh` no da por defecto; si ya la hay
+#      pero al token le falta alguno, `gh auth refresh -s <el que falte>`:
+#        · `read:packages` — sin él, instalar el CLI desde GitHub Packages
+#          devuelve 403 (paso 4);
+#        · `admin:public_key` — sin él, `sl auth init` no puede subir tu clave
+#          pública a tu cuenta de GitHub (paso 5).
+#      Son los dos pasos que hoy nadie sabe que existen, y cada uno se cobra
+#      una tarde.
 #   4. Instala el CLI de la flota, PINEADO a la versión de abajo (nunca `latest`),
 #      con el token que `gh auth token` resuelve en tu máquina, en el momento.
 #   5. Llama a `sl auth init`, que te da de alta como operador. Tu identidad es
@@ -72,6 +80,12 @@ CLI_PAQUETE="@skylabs-digital/cli"
 CLI_VERSION="1.31.1"
 CLI_REGISTRY="https://npm.pkg.github.com"
 NODE_MAYOR_MINIMO=24
+
+# El piso de sops, y no es una preferencia: `sl auth init` se planta abajo de
+# esto (SOPS_MINIMO en su preflight). Es la versión desde la que sops sabe usar
+# una clave SSH como identidad age, que es con lo que hoy se descifra.
+SOPS_MAYOR_MINIMO=3
+SOPS_MENOR_MINIMO=10
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/skylabs"
 
@@ -123,7 +137,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   # El encabezado entero, menos el shebang: de la línea 2 a la de "Fuente:".
   # Si el encabezado crece, este número crece con él — o `--help` lo corta a la
   # mitad y nadie se entera.
-  sed -n '2,63p' "$0" 2>/dev/null || true
+  sed -n '2,71p' "$0" 2>/dev/null || true
   exit 0
 fi
 
@@ -160,7 +174,7 @@ ACTUALIZAR=()      # fórmulas de brew a actualizar
 # que este mismo script te recomienda al final— chequea el binario `age`, y una
 # máquina que todavía tenga una clave age del modelo anterior la deriva con
 # `age-keygen -y`. Sacarlo de acá dejaría rojo un doctor que hoy está verde.
-for cmd in gh sops age; do
+for cmd in gh age; do
   if command -v "$cmd" >/dev/null 2>&1; then
     ok "$cmd — $(command -v "$cmd")"
   else
@@ -168,6 +182,49 @@ for cmd in gh sops age; do
     FALTAN+=("$cmd")
   fi
 done
+
+# sops va aparte porque no alcanza con que esté: `sl auth init` corta en seco
+# con un sops anterior a 3.10, que es la versión desde la que una clave SSH
+# sirve de identidad age. Y ése es justamente el caso que este paso existe para
+# atajar: una máquina que YA tenía sops 3.9 pasa verde por acá si sólo miramos
+# que el binario exista, y recién muere en el paso 5, cuando ya instaló todo.
+#
+# `--disable-version-check` no es cosmético, y es la misma bandera que usa el
+# CLI: sin ella `sops --version` sale a la red a preguntarle a GitHub si hay
+# una versión nueva —una máquina sin internet se quedaría colgada acá— y desde
+# sops 3.13 imprime encima un párrafo de deprecación más largo que la respuesta.
+if command -v sops >/dev/null 2>&1; then
+  sops_v="$(sops --version --disable-version-check 2>/dev/null | head -1 || true)"
+  # Un sops lo bastante viejo no conoce la bandera y no imprime nada: ahí se
+  # vuelve a preguntar sin ella. Es el caso que MÁS importa cazar —cuanto más
+  # viejo, más seguro que no llega a 3.10—, así que no puede quedar en un
+  # "no pude leer la versión" que lo deja pasar.
+  [[ -n "$sops_v" ]] || sops_v="$(sops --version 2>/dev/null | head -1 || true)"
+  sops_mayor=""; sops_menor=""
+  if [[ "$sops_v" =~ ([0-9]+)\.([0-9]+) ]]; then
+    sops_mayor="${BASH_REMATCH[1]}"
+    sops_menor="${BASH_REMATCH[2]}"
+  fi
+  if [[ -z "$sops_mayor" ]]; then
+    # Si la versión no se puede leer, no se opina — igual que hace el CLI. Peor
+    # sería plantar acá a alguien cuyo sops sí sirve y sólo imprime distinto.
+    aviso "sops — está ($(command -v sops)) pero no pude leerle la versión. Necesita >= ${SOPS_MAYOR_MINIMO}.${SOPS_MENOR_MINIMO}."
+  elif [[ "$sops_mayor" -gt "$SOPS_MAYOR_MINIMO" ]] ||
+       { [[ "$sops_mayor" -eq "$SOPS_MAYOR_MINIMO" ]] && [[ "$sops_menor" -ge "$SOPS_MENOR_MINIMO" ]]; }; then
+    ok "sops — ${sops_v}"
+  elif [[ "$(command -v sops)" == "$(brew --prefix)"/* ]]; then
+    aviso "sops — ${sops_v}, y hace falta >= ${SOPS_MAYOR_MINIMO}.${SOPS_MENOR_MINIMO}"
+    ACTUALIZAR+=("sops")
+  else
+    # Mismo criterio que con node: si no salió de brew, no es este script el
+    # que lo tiene que tocar. El binario suelto de los releases es una forma
+    # habitual de tener sops, y pisarlo con brew dejaría dos.
+    morir "sops ${sops_v} es menor que ${SOPS_MAYOR_MINIMO}.${SOPS_MENOR_MINIMO}, y no salió de brew ($(command -v sops)). Con uno más viejo, 'sl auth init' corta: es desde ${SOPS_MAYOR_MINIMO}.${SOPS_MENOR_MINIMO} que sops sabe descifrar con tu clave SSH. Actualizalo por donde lo instalaste (o bajá el binario de github.com/getsops/sops/releases) y volvé a correr este script."
+  fi
+else
+  aviso "sops — no está"
+  FALTAN+=("sops")
+fi
 
 # node necesita, además de existir, ser >= 24. Y si no salió de brew (nvm, fnm,
 # volta, asdf), no es este script el que lo tiene que tocar.
@@ -223,27 +280,27 @@ else
   aviso "No encontré corepack, que viene con node. Revisá tu instalación de node."
 fi
 
-# ── 3. sesión de gh y el scope read:packages ─────────────────────────────────
+# ── 3. sesión de gh y los scopes que no vienen solos ─────────────────────────
 
 titulo "3/5 · Sesión de GitHub"
 
 scopes_de_gh() { gh auth status 2>&1 | sed -n "s/.*Token scopes: *//p" | tr -d "'"; }
-tiene_read_packages() { scopes_de_gh | grep -q 'read:packages'; }
+tiene_scope()  { scopes_de_gh | grep -q "$1"; }
 
 if gh auth status >/dev/null 2>&1; then
   ok "gh — ya hay sesión ($(gh api user --jq .login 2>/dev/null || echo 'usuario desconocido'))"
 else
   aviso "gh — no hay sesión."
-  hay_terminal || morir "Necesito una terminal para 'gh auth login'. Corré el script desde una, o corré: gh auth login -s read:packages"
-  info "Voy a correr:  gh auth login -s read:packages"
-  confirmar "¿Lo hago?" || morir "Sin sesión de gh no puedo bajar el CLI. Corré: gh auth login -s read:packages"
-  gh auth login -s read:packages <"$TTY_IN"
+  hay_terminal || morir "Necesito una terminal para 'gh auth login'. Corré el script desde una, o corré: gh auth login -s read:packages -s admin:public_key"
+  info "Voy a correr:  gh auth login -s read:packages -s admin:public_key"
+  confirmar "¿Lo hago?" || morir "Sin sesión de gh no puedo bajar el CLI. Corré: gh auth login -s read:packages -s admin:public_key"
+  gh auth login -s read:packages -s admin:public_key <"$TTY_IN"
 fi
 
 # El token que deja `gh auth login` NO trae read:packages salvo que se lo pidas.
 # Sin ese scope, `npm install -g` contra GitHub Packages devuelve 403. Está
 # medido, y es el paso que hoy hace perder la tarde.
-if tiene_read_packages; then
+if tiene_scope 'read:packages'; then
   ok "El token tiene read:packages."
 elif [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
   aviso "Estás autenticado con un token de una variable de entorno (GH_TOKEN/GITHUB_TOKEN):"
@@ -253,13 +310,41 @@ else
   info "Voy a correr:  gh auth refresh -s read:packages"
   if confirmar "¿Lo hago?"; then
     gh auth refresh -s read:packages <"${TTY_IN:-/dev/null}"
-    if tiene_read_packages; then
+    if tiene_scope 'read:packages'; then
       ok "Listo: el token ya tiene read:packages."
     else
       aviso "Sigo sin ver read:packages en los scopes. Si el paso siguiente da 403, es por acá."
     fi
   else
     aviso "Seguimos sin el scope. Si el paso 4 da 403, corré: gh auth refresh -s read:packages"
+  fi
+fi
+
+# Y el segundo que tampoco viene solo, por exactamente el mismo motivo por el
+# que existe el bloque de arriba. En el paso 5, `sl auth init` sube tu clave
+# pública a tu cuenta con `gh ssh-key add`, y eso pide `admin:public_key`, que
+# `gh auth login` tampoco da por defecto. Ojo con pensar que es un caso raro:
+# en una Mac nueva la clave se acaba de generar, así que NO está en tu cuenta
+# todavía y la subida se intenta SIEMPRE. Mirar qué claves tenés cargadas no
+# pide nada —`sl` las lee por el endpoint público—; subir una, sí.
+if tiene_scope 'admin:public_key'; then
+  ok "El token tiene admin:public_key."
+elif [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+  aviso "Estás autenticado con un token de una variable de entorno (GH_TOKEN/GITHUB_TOKEN):"
+  aviso "no lo puedo refrescar. Asegurate de que ese token tenga admin:public_key."
+else
+  aviso "Al token le falta el scope admin:public_key — sin él, 'sl auth init' no puede subir tu clave."
+  info "Voy a correr:  gh auth refresh -s admin:public_key"
+  if confirmar "¿Lo hago?"; then
+    gh auth refresh -s admin:public_key <"${TTY_IN:-/dev/null}"
+    if tiene_scope 'admin:public_key'; then
+      ok "Listo: el token ya tiene admin:public_key."
+    else
+      aviso "Sigo sin ver admin:public_key en los scopes. Si el paso 5 no puede subir tu clave, es por acá."
+    fi
+  else
+    aviso "Seguimos sin el scope. Si el paso 5 falla al subir la clave, corré: gh auth refresh -s admin:public_key"
+    aviso "(o subila a mano en https://github.com/settings/keys, que es la otra salida que te va a ofrecer)."
   fi
 fi
 
