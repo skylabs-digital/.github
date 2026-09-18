@@ -14,6 +14,10 @@
 #
 #   1. Verifica que estén `brew`, `node` (>= 24), `gh`, `sops` y `age`.
 #      Lo que falte, te lo dice y te PREGUNTA antes de instalarlo con brew.
+#      `sops` tiene que ser 3.10 o más nuevo: es desde esa versión que sabe
+#      usar una clave SSH como identidad, y hoy se descifra con tu clave SSH.
+#      `age` ya no genera ninguna identidad tuya, pero sigue en la lista, y hay
+#      un porqué: está escrito en la sección 1 (herramientas), más abajo.
 #   2. `corepack enable` — es lo que da `yarn`; los repos lo declaran en
 #      `packageManager` y no traen yarn adentro.
 #   3. `gh auth status`. Si no hay sesión, `gh auth login`. Si la hay pero al
@@ -22,8 +26,17 @@
 #      desde GitHub Packages devuelve 403.
 #   4. Instala el CLI de la flota, PINEADO a la versión de abajo (nunca `latest`),
 #      con el token que `gh auth token` resuelve en tu máquina, en el momento.
-#   5. Llama a `sl auth init`, que genera tus identidades (age + SSH), abre el PR
-#      de alta y espera el merge avisándote cuando ya podés descifrar.
+#   5. Llama a `sl auth init`, que te da de alta como operador. Tu identidad es
+#      tu cuenta de GitHub, y tu clave es una SSH tuya —por defecto la de
+#      siempre, `~/.ssh/id_ed25519`—: con ella descifra sops y con ella entrás
+#      al bastión. No se genera ninguna clave age, y no hay ningún PR.
+#      La aprobación es estar en el team `skylabs-digital/operators`: si no
+#      estás, te dice a quién pedírselo y sale sin tocar nada. Si estás, elige
+#      tu clave (en una terminal te las lista, con las que no sirven y por qué,
+#      y genera una nueva sin passphrase si hace falta), la sube a tu cuenta de
+#      GitHub si no estaba, le pide a infra que corra su reconciliador —el que
+#      lee el team y reescribe el registro— y espera a que te sume y a que CI
+#      re-cifre, avisándote cuando ya podés descifrar.
 #
 # QUÉ INSTALA: sólo lo de arriba, y sólo lo que falte. Todo con `brew`, salvo el
 # CLI, que va con `npm install -g`. Nada con `sudo`.
@@ -56,7 +69,7 @@ set -euo pipefail
 # este repo, que es lo que vuelve auditable lo que corre en las máquinas del
 # equipo. `sl` avisa solo cuando se quedó viejo contra un descriptor nuevo.
 CLI_PAQUETE="@skylabs-digital/cli"
-CLI_VERSION="1.11.0"
+CLI_VERSION="1.31.1"
 CLI_REGISTRY="https://npm.pkg.github.com"
 NODE_MAYOR_MINIMO=24
 
@@ -107,7 +120,10 @@ confirmar() {
 # ── 0. dónde estamos ─────────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,50p' "$0" 2>/dev/null || true
+  # El encabezado entero, menos el shebang: de la línea 2 a la de "Fuente:".
+  # Si el encabezado crece, este número crece con él — o `--help` lo corta a la
+  # mitad y nadie se entera.
+  sed -n '2,63p' "$0" 2>/dev/null || true
   exit 0
 fi
 
@@ -138,6 +154,12 @@ ok "brew — $(brew --version 2>/dev/null | head -1)"
 FALTAN=()          # fórmulas de brew a instalar
 ACTUALIZAR=()      # fórmulas de brew a actualizar
 
+# `age` ya no es parte de tu identidad: desde que los operadores salen de
+# GitHub, tu clave es una SSH y sops la usa directo (por eso hace falta sops
+# >= 3.10). Sigue en la lista igual, y no es inercia: `sl doctor` —el comando
+# que este mismo script te recomienda al final— chequea el binario `age`, y una
+# máquina que todavía tenga una clave age del modelo anterior la deriva con
+# `age-keygen -y`. Sacarlo de acá dejaría rojo un doctor que hoy está verde.
 for cmd in gh sops age; do
   if command -v "$cmd" >/dev/null 2>&1; then
     ok "$cmd — $(command -v "$cmd")"
@@ -293,15 +315,20 @@ fi
 titulo "5/5 · Tu identidad de operador (sl auth init)"
 
 if [[ -f "$CONFIG_DIR/config.env" ]]; then
-  ok "Ya tenés $CONFIG_DIR/config.env: esta máquina ya está dada de alta."
-  info "Si querés revisar cómo quedó:  sl doctor"
+  ok "Ya tenés $CONFIG_DIR/config.env: esta máquina ya pasó por el alta."
+  info "Quién sos, con qué clave y si el registro ya te lista, lo dice:  sl doctor"
   if confirmar "¿Corro 'sl auth init' igual?"; then
     sl auth init <"$TTY_IN"
   fi
 else
-  info "'sl auth init' genera tus claves age y SSH, abre el PR de alta contra infra"
-  info "y espera el merge para avisarte cuando ya podés descifrar los secretos."
-  info "Hasta que ese PR se mergee y CI re-cifre, tu clave nueva no descifra NADA."
+  info "'sl auth init' te da de alta como operador. Tu identidad es tu cuenta de"
+  info "GitHub y tu clave es una SSH tuya: por defecto ~/.ssh/id_ed25519, y si tenés"
+  info "varias te pregunta con cuál. La sube a tu cuenta si no estaba, le pide a infra"
+  info "que corra su reconciliador, y espera a que te sume al registro y a que CI"
+  info "re-cifre los secretos con tu clave."
+  info "La aprobación es estar en el team skylabs-digital/operators: si todavía no"
+  info "estás, te dice a quién pedírselo y sale sin tocar nada. No hay PR que mergear."
+  info "Hasta que el registro te liste y CI re-cifre, tu clave no descifra NADA."
   if hay_terminal && confirmar "¿Lo corro ahora?"; then
     sl auth init <"$TTY_IN"
   else
@@ -312,7 +339,8 @@ fi
 # ── cierre ───────────────────────────────────────────────────────────────────
 
 titulo "Listo."
-info "Una vez que el PR de alta esté mergeado, cada repo se alista con un comando:"
+info "Una vez que el registro te liste y CI haya re-cifrado —'sl doctor' te lo dice—,"
+info "cada repo se alista con un comando:"
 info ""
 info "    git clone git@github.com:skylabs-digital/<repo>.git"
 info "    cd <repo> && sl setup"
