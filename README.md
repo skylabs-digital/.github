@@ -21,6 +21,7 @@ permissions and hands the pipeline to one of these reusables:
 | `security.yml` | everyone (called by the two above) | OSV-Scanner · Gitleaks · Grype · weekly rolling issue |
 | `docs-publish.yml` | every repo with `docs/public/` | announce the section (`sl cac apply`) · publish the pages (`sl docs sync`), with its own pinned `sl` and the job's OIDC token |
 | `deploy-manual.yml` | apps, on demand | the Actions button: typed prod gate · one `sl deploy <env> [servicio] --tag <tag>` · rollback on failure |
+| `foreign-timezone.yml` | repos whose tests do not pin `TZ` yet | the whole suite once more under `Asia/Tokyo`, after checking the clock really moved |
 
 The **FULL / REDUCED** fork lives inside each reusable: pull requests get checks and security;
 a push to `main` also versions, publishes or builds, and deploys. Third-party actions are
