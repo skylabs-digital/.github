@@ -266,8 +266,10 @@ jobs:
   # is skipped; OSV + Gitleaks run on every event.
   # ============================================================
   security:
+    # The job name keeps "@v1" on purpose: it is part of a required status check name in the
+    # org and repo rulesets. The ref below decides the version: security.yml is consumed at @main.
     name: Security (org reusable@v1)
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    uses: skylabs-digital/.github/.github/workflows/security.yml@main
     secrets:
       npm-token: ${{ secrets.GHCR_TOKEN }}
 
