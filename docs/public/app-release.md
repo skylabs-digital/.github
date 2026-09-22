@@ -14,7 +14,7 @@ topology comes from the app's own `deploy/skylabs.yaml`, and the deploy is a sin
 
 ```mermaid
 flowchart TD
-    MX["matrix<br/>sl app services"] --> SEC["security<br/>security.yml@v1"]
+    MX["matrix<br/>sl app services"] --> SEC["security<br/>security.yml@main"]
     SC["static-checks<br/>yarn ci"] --> V
     SEC --> V{"version<br/>push to main only"}
     SC --> CP["cac-plan<br/>pull requests only"]
@@ -28,7 +28,7 @@ flowchart TD
 |---|---|---|
 | `matrix` | every event but `repository_dispatch` | `yarn sl app services --json` reads the services from the descriptor. The list drives the build matrix and the images Grype scans. |
 | `static-checks` | pull requests and pushes | `yarn ci` once, repo-wide: typecheck, lint, test, build. |
-| `security` | every event but `repository_dispatch` | Calls [`security.yml@v1`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
+| `security` | every event but `repository_dispatch` | Calls [`security.yml@main`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
 | `version` | push to `main`, not on a `chore(release):` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
 | `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`. |
 | `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable`. On failure, `sl deploy <env> rollback`. |

@@ -7,7 +7,7 @@ name: Lib Release (reusable)
 #
 #   STAGE 1  ci         static-checks: typecheck + lint + test (coverage floor)
 #                       + Stryker incremental mutation (parallel required check)
-#   STAGE 1  security   org reusable security.yml@v1 (OSV + Gitleaks; no images)
+#   STAGE 1  security   org reusable security.yml@main (OSV + Gitleaks; no images)
 #   STAGE 2  release    semantic-release (version + npm publish) — push:main only
 #
 # The fork point is the `release` job: `if: push && ref==main`. On a PR it
@@ -264,12 +264,17 @@ jobs:
           key: stryker-incremental-${{ github.ref_name }}-${{ github.sha }}
 
   # ============================================================
-  # STAGE 1 — SECURITY (org reusable@v1). No docker-images for libs, so Grype
+  # STAGE 1 — SECURITY (org reusable, @main). No docker-images for libs, so Grype
   # is skipped; OSV + Gitleaks run on every event.
   # ============================================================
   security:
+    # The job name keeps "@v1" on purpose: "release / Security (org reusable@v1) / …" is a
+    # required status check in the org ruleset protect-main-apps and in each repo's ruleset.
+    # Renaming it blocks every PR in the fleet until those rulesets are updated in lockstep.
+    # The ref below is what decides the version: security.yml is consumed at @main, like the
+    # rest of the reusables.
     name: Security (org reusable@v1)
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    uses: skylabs-digital/.github/.github/workflows/security.yml@main
     secrets:
       npm-token: ${{ secrets.GHCR_TOKEN }}
 

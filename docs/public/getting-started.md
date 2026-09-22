@@ -138,7 +138,7 @@ permissions:
 
 jobs:
   security:
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    uses: skylabs-digital/.github/.github/workflows/security.yml@main
     with:
       gitleaks-only: true # a repo without package.json
 ```
