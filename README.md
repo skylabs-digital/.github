@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | 🧱 **Repo type** | Org reusable workflows and the new-machine bootstrap (public) |
-| 🏷️ **Version** | Consumed at `@main` (release, docs) and `@v1` (`security.yml`) |
+| 🏷️ **Version** | Consumed at `@main` |
 | 🚦 **Status** | 🟢 Stable — every app and library in the org releases through it |
 | 📚 **Docs** | [docs.skylabs.digital/workflows](https://docs.skylabs.digital/workflows/) |
 
@@ -88,6 +88,7 @@ walkthrough are on the [docs site](https://docs.skylabs.digital/workflows/).
 
 ## 🚢 Releases
 
-There is no release pipeline: merging to `main` publishes the release and docs reusables
-immediately. `security.yml` is consumed at the `v1` tag, which is moved deliberately when a
-change is ready for every repo.
+There is no release pipeline: merging to `main` publishes every reusable (release, docs and
+`security.yml`) to the whole fleet immediately, so `main` is the stable line — it only moves
+through a reviewed PR that passes the actionlint and parser checks. The `v1` tag is frozen at
+2026-09-02 and no longer consumed by the fleet.

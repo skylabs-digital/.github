@@ -13,7 +13,7 @@ to `main`, also `release`, which runs semantic-release and publishes to GitHub P
 flowchart LR
     CI["ci<br/>typecheck, lint, test, build"] --> R{"release<br/>push to main only"}
     MU["mutation<br/>Stryker, informative"] --> R
-    SEC["security<br/>security.yml@v1"] --> R
+    SEC["security<br/>security.yml@main"] --> R
     R --> P[("GitHub Packages")]
 ```
 
@@ -23,7 +23,7 @@ flowchart LR
 |---|---|---|
 | `ci` | pull requests and pushes | `yarn install --immutable`, `yarn typecheck`, `yarn lint`, `extra-ci-steps`, `yarn test --coverage`, `yarn build`, `extra-ci-steps-post-build`. |
 | `mutation` | pull requests and pushes, when `run-mutation` | `yarn test:mutation` (or `yarn mutation`) with Stryker's incremental state cached per branch. **Informative:** a low score writes a warning and a summary, never fails the job. |
-| `security` | every event | [`security.yml@v1`](./security.md) without images. |
+| `security` | every event | [`security.yml@main`](./security.md) without images. |
 | `release` | push to `main` | The **fork point**. Builds and runs semantic-release: version from conventional commits, `CHANGELOG.md`, publish, GitHub release. |
 
 `release` runs when nothing upstream failed — `mutation` may be skipped or below threshold and

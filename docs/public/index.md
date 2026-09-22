@@ -14,7 +14,7 @@ permissions, then hands the whole pipeline to one of these.
 |---|---|
 | Repo | [`skylabs-digital/.github`](https://github.com/skylabs-digital/.github) (public) |
 | Status | 🟢 Stable — every app and library in the fleet releases through it |
-| Consumed at | `@main` for the release and docs pipelines, `@v1` for `security.yml` |
+| Consumed at | `@main` for every reusable |
 
 ## The reusables
 
@@ -30,7 +30,7 @@ permissions, then hands the whole pipeline to one of these.
 flowchart LR
     A["app repo<br/>release.yml"] --> AR["app-release.yml"]
     L["library repo<br/>release.yml"] --> LB["lib-release.yml"]
-    AR --> S["security.yml@v1"]
+    AR --> S["security.yml@main"]
     LB --> S
     A -.->|"docs job"| DP["docs-publish.yml"]
     L -.->|"docs job"| DP

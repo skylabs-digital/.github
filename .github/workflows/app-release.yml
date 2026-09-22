@@ -8,10 +8,10 @@ name: App Release (reusable)
 #
 #   STAGE 0  matrix           (every event: PR + push:main + schedule)
 #   STAGE 1  static-checks    (every event: PR + push:main + schedule)
-#   STAGE 1  security         (org reusable security.yml@v1 — every event)
+#   STAGE 1  security         (org reusable security.yml@main — every event)
 #   STAGE 2  version          (push:main only — conventional-commit bumper)
 #   STAGE 3  build-images     (needs version, bumped==true)
-#   STAGE 4  image-scan        FOLDED INTO security.yml@v1 (Grype, push/sched only)
+#   STAGE 4  image-scan        FOLDED INTO security.yml@main (Grype, push/sched only)
 #   STAGE 5  deploy            (needs version + build, bumped==true — ONE job,
 #                               ONE `sl deploy` invocation)
 #   STAGE 6  secrets-rotate   (repository_dispatch `skylabs-operators-changed`
@@ -268,12 +268,17 @@ jobs:
         run: yarn ci
 
   # ============================================================
-  # STAGE 1 — SECURITY (org reusable@v1) — also hosts STAGE 4 image-scan.
+  # STAGE 1 — SECURITY (org reusable, @main) — also hosts STAGE 4 image-scan.
   # docker-images is derived from the descriptor matrix (job `matrix`), not
   # from a caller input. OSV + Gitleaks run on every event; Grype (image-scan)
   # runs push/schedule only — gated inside the reusable.
   # ============================================================
   security:
+    # The job name keeps "@v1" on purpose: "release / Security (org reusable@v1) / …" is a
+    # required status check in the org ruleset protect-main-apps and in each repo's ruleset.
+    # Renaming it blocks every PR in the fleet until those rulesets are updated in lockstep.
+    # The ref below is what decides the version: security.yml is consumed at @main, like the
+    # rest of the reusables.
     name: Security (org reusable@v1)
     needs: [matrix]
     # `matrix` is skipped on Dependabot PRs (see its `if:` above). Today's
@@ -282,21 +287,21 @@ jobs:
     # Replicate that here: run unless `matrix` actually failed/was cancelled,
     # falling back to an empty docker-images list when it was skipped. Grype
     # never sees that empty list anyway on a Dependabot PR, since
-    # security.yml@v1 gates it to push/schedule internally.
+    # security.yml gates it to push/schedule internally.
     # `repository_dispatch`: una rotación de recipients (job `secrets-rotate`)
     # no trae código nuevo que escanear, y la matriz de Grype es lo más caro
     # del pipeline.
     if: ${{ !cancelled() && needs.matrix.result != 'failure' && github.event_name != 'repository_dispatch' }}
-    uses: skylabs-digital/.github/.github/workflows/security.yml@v1
+    uses: skylabs-digital/.github/.github/workflows/security.yml@main
     with:
-      # security.yml@v1 reads only {name, context, dockerfile} per entry and
+      # security.yml reads only {name, context, dockerfile} per entry and
       # ignores the extra kind/health/migrator keys, so we forward it verbatim.
       docker-images: ${{ needs.matrix.result == 'success' && needs.matrix.outputs.services || '[]' }}
     secrets:
       # Grype builds each image to scan it, which runs `yarn workspaces focus`
       # and pulls the private @skylabs-digital/* packages from GHCR npm. Use the
       # GHCR_TOKEN PAT (read:packages) for that. Do NOT forward app-id/private-key:
-      # security.yml@v1 prefers an ephemeral GitHub App installation token over
+      # security.yml prefers an ephemeral GitHub App installation token over
       # npm-token, but that App token lacks read:packages → 403 Forbidden on the
       # private-package install (whole Grype matrix fails). The App token is only
       # needed by the version stage (commit/tag push), which mints its own.

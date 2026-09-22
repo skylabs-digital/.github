@@ -7,7 +7,7 @@ description: OSV-Scanner, Gitleaks and Grype with a fixability gate, and a weekl
 # `security.yml`
 
 The org security scan. `app-release.yml` and `lib-release.yml` call it for you; a repo with no
-release pipeline calls it directly. It is consumed at the `v1` tag.
+release pipeline calls it directly. It is consumed at `@main`, like the rest of the reusables. The `v1` tag is frozen at 2026-09-02 and no longer consumed.
 
 ## Jobs
 
