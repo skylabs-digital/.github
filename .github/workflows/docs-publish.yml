@@ -16,9 +16,9 @@ name: Docs publish (reusable)
 # `docs.skylabs.digital`): no secret is needed for docs itself. GHCR_TOKEN is
 # only for installing the private @skylabs-digital/* packages.
 #
-# THE `sl` HERE IS THE REUSABLE'S, not the repo's pin (`cli-version`): the
-# apps pin `sl` 1.8–1.12 for their deploy pipeline, and bumping that pin just
-# so the docs job can speak `auth: github` would change how they deploy. The
+# THE `sl` HERE IS THE REUSABLE'S, not the repo's pin (`cli-version`): each
+# app pins `sl` for its own deploy pipeline, and bumping that pin just so the
+# docs job can speak a newer protocol would change how it deploys. The
 # repo only needs `@skylabs-digital/docs-cac` (and `@skylabs-digital/cac`,
 # which an app with CaC already has) so `cac/docs.ts` resolves its imports.
 #
@@ -67,7 +67,7 @@ on:
       cli-version:
         description: 'The `sl` this job runs (>= 1.21.0: `auth: github`, `--no-create-keys` without a secrets sink, `X-Version`)'
         type: string
-        default: '1.21.0'
+        default: '1.37.0'
       ref:
         description: >
           What to check out. Default `main`: after a release the version bump is
@@ -152,6 +152,10 @@ jobs:
       # environment), the protocol just requires one. `--no-create-keys`: this
       # stack has no keys, and without it `sl cac` demands a writable secrets
       # destination that a library does not have.
+      # Since sl 1.36.0 an apply against qa/prod also requires the checkout to
+      # be what's released: HEAD on origin/main (this job checks out `main`) and
+      # no modified tracked file. A repo that tracks a file `yarn install`
+      # rewrites (`.yarn/install-state.gz`) stops here until it untracks it.
       - if: steps.detect.outputs.publish == 'true'
         name: Announce the section (sl cac apply)
         env:
