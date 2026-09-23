@@ -114,6 +114,7 @@ line fails the deploy.
 | `node-version` | string | `24` | Node for every job. |
 | `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Where the jobs run. |
 | `deploy` | boolean | `true` | `false` runs everything except the deploy (CI, version, image, security, CaC). For a service whose host is not a stack of the descriptor and deploys with its own job. |
+| `sl-min-version` | string | `1.22.0` | The oldest `@skylabs-digital/cli` the repo may pin for `deploy`, `cac-plan` and `cac-apply`; older fails the job. The default is the fleet's floor on 2026-09-23: raise it to force a pin wave. |
 
 ## Outputs
 

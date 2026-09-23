@@ -124,6 +124,14 @@ on:
           comportamiento.
         type: boolean
         default: true
+      sl-min-version:
+        description: >
+          The oldest `@skylabs-digital/cli` the repo may pin for the jobs that
+          run `sl` against an environment (deploy, CaC). Default: the fleet's
+          floor on 2026-09-23, so no app changes. Raise it to force a pin wave
+          (DEP-08(3)).
+        type: string
+        default: '1.22.0'
     outputs:
       version:
         description: >
@@ -751,6 +759,29 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
       # SSH HOST KEYS PINNED, NOT TOFU (DEP-10). `sl` connects with
       # `StrictHostKeyChecking=accept-new` against the runner's persistent
       # ~/.ssh/known_hosts: the first contact accepts ANY key (a MITM there is
@@ -1036,6 +1067,31 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        if: steps.stack.outputs.present == 'true'
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
       # El registro de la plataforma. `sl cac` DERIVA la URL de cada provider
       # de `exports.<env>.URL` del descriptor de esa app, y para llegar al
       # descriptor necesita el registro: no lee `<PREFIJO>_URL` del entorno
@@ -1161,6 +1217,31 @@ jobs:
         run: yarn install --immutable
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        if: steps.stack.outputs.present == 'true'
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
       # Mismo motivo y mismo patrón que en `cac-plan`: `sl cac` deriva la URL
       # del provider del descriptor, y para eso necesita el registro.
       - name: Token para leer el registro

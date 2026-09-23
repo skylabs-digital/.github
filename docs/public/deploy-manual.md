@@ -73,6 +73,7 @@ rejects the name and prints the valid ones — it never deploys something that i
 | `confirm` | `''` | Must be exactly `prod` when `environment: prod`. |
 | `skip-migrate` | `false` | Full deploy without migrations (`sl deploy --skip-migrate`). |
 | `rollback-on-failure` | `true` | If `sl deploy` fails, redeploy the last-good release from its own checkout (images, fragment and env together), or roll back the images only when that is not possible — the same [rollback as the release](./app-release.md#rollback). Turn it off when you are deliberately deploying an older tag. |
+| `sl-min-version` | `1.22.0` | The oldest `@skylabs-digital/cli` the repo may pin; older fails the deploy before it touches the droplet. |
 | `node-version` | `24` | |
 | `runner-labels` | `["self-hosted","linux","x64","skylabs"]` | |
 
