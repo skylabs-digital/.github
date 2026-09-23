@@ -103,27 +103,27 @@ for wf in ar dm; do
   CURRENT_TEST="DEP-04 ${wf}: a failed deploy restores the last-good release's fragment, not only its images"
   rollback "${WORK_ROOT}/${wf}-rollback.sh" "" failure v1.0.0
   [ "$RB_RC" -eq 0 ] || fail "exit ${RB_RC}: $(cat "${WORK_ROOT}/rollback.log")"
-  grep -q '^sl deploy qa --tag v1.0.0 --skip-migrate \[fragment=fragment-of-v1.0.0\]$' "$LOG" \
+  grep -q '^sl deploy qa --tag v1.0.0 --skip-migrate --yes \[fragment=fragment-of-v1.0.0\]$' "$LOG" \
     && pass "sl deploy --tag v1.0.0 from v1.0.0's checkout" \
     || fail "calls: $(cat "$LOG")"
   ! grep -q 'rollback' "$LOG" && pass "no images-only rollback on top" || fail "calls: $(cat "$LOG")"
 
   CURRENT_TEST="DEP-04 ${wf}: when the redeploy fails, falls back to the images-only rollback"
   rollback "${WORK_ROOT}/${wf}-rollback.sh" "" failure v1.0.0 1
-  grep -q '^yarn sl deploy qa rollback$' "$LOG" && pass "images-only fallback" || fail "calls: $(cat "$LOG")"
+  grep -q '^yarn sl deploy qa rollback --yes$' "$LOG" && pass "images-only fallback" || fail "calls: $(cat "$LOG")"
 
   CURRENT_TEST="DEP-04 ${wf}: nothing to restore → images-only rollback, as before"
   rollback "${WORK_ROOT}/${wf}-rollback.sh" "" failure ""
-  [ "$(cat "$LOG")" = "yarn sl deploy qa rollback" ] && pass "images only" || fail "calls: $(cat "$LOG")"
+  [ "$(cat "$LOG")" = "yarn sl deploy qa rollback --yes" ] && pass "images only" || fail "calls: $(cat "$LOG")"
 
   CURRENT_TEST="DEP-04 ${wf}: a cancelled deploy gets the quick images-only rollback"
   rollback "${WORK_ROOT}/${wf}-rollback.sh" "" cancelled v1.0.0
-  [ "$(cat "$LOG")" = "yarn sl deploy qa rollback" ] && pass "images only" || fail "calls: $(cat "$LOG")"
+  [ "$(cat "$LOG")" = "yarn sl deploy qa rollback --yes" ] && pass "images only" || fail "calls: $(cat "$LOG")"
 done
 
 CURRENT_TEST="DEP-04 dm: a targeted deploy restores that service only"
 rollback "${WORK_ROOT}/dm-rollback.sh" app-web failure v1.0.0
-grep -q '^sl deploy qa app-web --tag v1.0.0 --skip-migrate \[fragment=fragment-of-v1.0.0\]$' "$LOG" \
+grep -q '^sl deploy qa app-web --tag v1.0.0 --skip-migrate --yes \[fragment=fragment-of-v1.0.0\]$' "$LOG" \
   && pass "app-web back to v1.0.0 with its fragment" || fail "calls: $(cat "$LOG")"
 
 finish

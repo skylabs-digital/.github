@@ -383,6 +383,24 @@ def check_installs_prefer_the_read_token(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+def check_every_sl_deploy_says_yes(wfs: dict[str, dict]) -> list[str]:
+    """Every write `sl deploy` passes `--yes` (SL-01, cli#79): without a
+    terminal, a prod deploy with cli >= 2.0 refuses unless `--yes` AND
+    GITHUB_ACTIONS AND GITHUB_RUN_ID. `--yes` is a global flag since 1.22.0,
+    the fleet's floor, so it is safe at every pin. `status` only reads."""
+    errors = []
+    for name, job_id, step, run in run_scripts(wfs):
+        for line in run.splitlines():
+            code = line.split("#", 1)[0]
+            if not re.search(r"(\bsl deploy\b|SL_BIN\}\" deploy\b)", code) or code.lstrip().startswith("echo"):
+                continue
+            if " status" in code:
+                continue
+            if "--yes" not in code:
+                errors.append(f"{name}:{job_id}:{step}: `{code.strip()}` without --yes")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -400,6 +418,7 @@ CHECKS = [
     check_deploy_keys_stay_where_they_are,
     check_no_expressions_in_shell,
     check_installs_prefer_the_read_token,
+    check_every_sl_deploy_says_yes,
 ]
 
 

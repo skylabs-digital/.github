@@ -915,7 +915,7 @@ jobs:
           CI: 'true'
           DEPLOY_ENV: ${{ inputs.deploy-env }}
           TAG: v${{ needs.version.outputs.version }}
-        run: yarn sl deploy "${DEPLOY_ENV}" --tag "${TAG}"
+        run: yarn sl deploy "${DEPLOY_ENV}" --tag "${TAG}" --yes
 
       # The `<env>-stable` retag is bookkeeping on the registry, not part of
       # the deploy: a `docker pull` of 400 MB that gets cut, or GHCR having a
@@ -992,7 +992,7 @@ jobs:
           images_only() {
             local args=("${DEPLOY_ENV}" rollback)
             if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
-            yarn sl deploy "${args[@]}"
+            yarn sl deploy "${args[@]}" --yes
           }
           echo "::warning::the deploy ${DEPLOY_OUTCOME}: rolling back ${SERVICE:-the app} in ${DEPLOY_ENV}"
 
@@ -1017,7 +1017,7 @@ jobs:
             args=("${DEPLOY_ENV}")
             if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
             args+=(--tag "${LAST_GOOD}" --skip-migrate)
-            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}"); then
+            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}" --yes); then
               echo "::warning::rolled back to ${LAST_GOOD}: images, fragment, env, edge and monitoring of that release. Migrations already applied stay applied."
               exit 0
             fi

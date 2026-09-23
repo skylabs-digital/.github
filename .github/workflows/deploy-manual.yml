@@ -471,8 +471,8 @@ jobs:
           if [ "${SKIP_MIGRATE}" = "true" ]; then
             ARGS+=(--skip-migrate)
           fi
-          echo "yarn sl deploy ${ARGS[*]}"
-          yarn sl deploy "${ARGS[@]}"
+          echo "yarn sl deploy ${ARGS[*]} --yes"
+          yarn sl deploy "${ARGS[@]}" --yes
 
       # Mismo rollback que el job `deploy` de app-release.yml, y por el mismo
       # motivo: un deploy que falló deja la imagen rota sirviendo tráfico.
@@ -503,7 +503,7 @@ jobs:
           images_only() {
             local args=("${DEPLOY_ENV}" rollback)
             if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
-            yarn sl deploy "${args[@]}"
+            yarn sl deploy "${args[@]}" --yes
           }
           echo "::warning::the deploy ${DEPLOY_OUTCOME}: rolling back ${SERVICE:-the app} in ${DEPLOY_ENV}"
 
@@ -528,7 +528,7 @@ jobs:
             args=("${DEPLOY_ENV}")
             if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
             args+=(--tag "${LAST_GOOD}" --skip-migrate)
-            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}"); then
+            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}" --yes); then
               echo "::warning::rolled back to ${LAST_GOOD}: images, fragment, env, edge and monitoring of that release. Migrations already applied stay applied."
               exit 0
             fi
