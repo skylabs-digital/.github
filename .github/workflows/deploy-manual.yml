@@ -49,11 +49,20 @@ name: Deploy Manual (reusable)
 # son los válidos (`ordenarServicios`, cli/src/deploy/contexto.ts).
 #
 # ----------------------------------------------------------------------------
-# QUÉ REF SE DESPLIEGA. Este workflow NO pasa `ref:` al checkout: usa el que el
-# operador eligió en el desplegable "Use workflow from" de Actions, que acepta
-# ramas Y TAGS. Elegir ahí el mismo `vX.Y.Z` que se pone en `tag` es lo que
-# hace que el descriptor, el fragmento de compose y los secretos que se empujan
-# al droplet sean los de esa versión y no los de la punta de main.
+# QUÉ REF SE DESPLIEGA: el tag. El checkout usa `ref: ${{ inputs.tag }}`, así
+# que el descriptor, el fragmento de compose y los secretos que se empujan al
+# droplet son los de esa versión, que es para la que se construyó la imagen.
+# Hasta 2026-09-23 el checkout era el de "Use workflow from" (la rama), y un
+# rollback de emergencia a v5.20.0 disparado desde main desplegaba la imagen
+# vieja con el compose y el descriptor de main: una mezcla que no existió nunca
+# (DEP-09, idachu run 35390862198). `sl` >= 1.36 además se niega a desplegar un
+# checkout que no es el del tag, así que sin esto no se puede subir el pin.
+#
+# DESDE DÓNDE SE DISPARA: sólo desde la rama por defecto o desde un tag `v*`
+# ("Use workflow from"). El job `deploy` lleva SOPS_AGE_KEY y DEPLOY_SSH_KEY;
+# el caller que lo invoca tiene que ser el revisado, no el de una rama
+# cualquiera (SEC-01). Con el tag en el checkout, disparar desde main no cambia
+# nada de lo que se despliega.
 #
 # ----------------------------------------------------------------------------
 # SEGURIDAD. Ningún input llega a un `run:` ni a un comando remoto por `${{ }}`:
@@ -78,9 +87,9 @@ on:
         required: true
       tag:
         description: >
-          Tag de imagen a desplegar (`vX.Y.Z`, un sha, `latest`). Obligatorio:
-          sin tag el compose cae a `:latest`, que es el bug histórico que
-          `sl deploy` cierra.
+          Versión a desplegar, `vX.Y.Z`: es a la vez el tag de imagen y el tag
+          de git que se checkoutea. Ni `latest` ni un sha: el checkout tiene que
+          ser el del release para el que se construyó la imagen (DEP-09).
         type: string
         required: true
       service:
@@ -172,8 +181,24 @@ jobs:
           CONFIRM: ${{ inputs.confirm }}
           SERVICE: ${{ inputs.service }}
           TAG: ${{ inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+
+          # El tag es también el ref del checkout (DEP-09): sólo un release.
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Tag inválido::tag es \"${TAG}\"; tiene que ser un release vX.Y.Z (ni latest ni un sha): es el tag de imagen y el ref que se checkoutea."
+            exit 1
+          fi
+
+          # SEC-01: el caller que llega a SOPS_AGE_KEY es el revisado.
+          case "${GITHUB_REF}" in
+            "refs/heads/${DEFAULT_BRANCH}"|refs/tags/v*) ;;
+            *)
+              echo "::error title=Ref no permitido::Este deploy se disparó desde ${GITHUB_REF}. Elegí la rama por defecto (${DEFAULT_BRANCH}) o un tag v* en \"Use workflow from\": el job de deploy lleva las llaves de deploy, y el workflow que lo llama tiene que ser el revisado. Lo que se despliega sale del tag de todos modos."
+              exit 1
+              ;;
+          esac
 
           case "${DEPLOY_ENV}" in
             qa|prod) ;;
@@ -196,7 +221,8 @@ jobs:
             echo "| entorno | \`${DEPLOY_ENV}\` |"
             echo "| servicio | \`${SERVICE:-(la app entera)}\` |"
             echo "| tag | \`${TAG}\` |"
-            echo "| ref del checkout | \`${GITHUB_REF}\` |"
+            echo "| ref del checkout | \`${TAG}\` |"
+            echo "| disparado desde | \`${GITHUB_REF}\` |"
             echo "| lo pidió | @${GITHUB_ACTOR} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -223,10 +249,12 @@ jobs:
       group: deploy-manual-${{ inputs.environment }}-${{ inputs.service || 'app' }}
       cancel-in-progress: false
     steps:
-      # Sin `ref:`: el checkout es el que el operador eligió en "Use workflow
-      # from" (rama o tag). Es de dónde salen deploy/skylabs.yaml,
-      # deploy/compose.yml y deploy/secrets/<env>.env.
+      # El tag, no la rama del dispatch (DEP-09): de acá salen
+      # deploy/skylabs.yaml, deploy/compose.yml y deploy/secrets/<env>.env, y
+      # tienen que ser los del release cuya imagen se despliega.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.tag }}
 
       # El registro de la plataforma: sparse checkout de infra, sólo registry/.
       # De ahí salen el bastión, las IPs privadas y los recipients age.
@@ -250,18 +278,28 @@ jobs:
           token: ${{ steps.registry-token.outputs.token }}
 
       - name: Install sops (pinned + checksum)
-        # Mismo pin y mismo checksum que app-release.yml y que
-        # infra/.github/workflows/provision-env.yml.
+        # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          if [ ! -x "$HOME/.local/bin/sops-v3.11.0" ]; then
-            curl -sSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64"
-            echo "775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef  /tmp/sops" | sha256sum -c -
-            install -m 0755 /tmp/sops "$HOME/.local/bin/sops-v3.11.0"
+          SOPS_VER=v3.11.0
+          SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          ln -sf "$HOME/.local/bin/sops-v3.11.0" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0

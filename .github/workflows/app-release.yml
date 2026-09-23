@@ -702,33 +702,27 @@ jobs:
 
       - name: Install sops (pinned + checksum)
         # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
-        # El checksum se verifica SIEMPRE y justo antes de usar el binario,
-        # esté recién bajado o cacheado. Antes el `sha256sum -c` vivía DENTRO
-        # del `if [ ! -x … ]`: como $HOME sobrevive entre jobs en los runners
-        # self-hosted, un sops plantado por cualquier otro job del pool se
-        # reusaba para siempre — y este paso lo deja en el PATH de un job que
-        # corre con SOPS_AGE_KEY en el entorno, o sea el binario que descifra
-        # prod. Si no coincide, se borra y se vuelve a bajar; si la descarga
-        # tampoco coincide, el job corta con ::error::. No devolver la
-        # verificación adentro del `if`. Bead sl-zldd.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         run: |
           set -euo pipefail
           SOPS_VER=v3.11.0
           SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
-          SOPS_BIN="$HOME/.local/bin/sops-$SOPS_VER"
-          SOPS_TMP="${RUNNER_TEMP:-/tmp}/sops-$SOPS_VER.$$"
-          mkdir -p "$HOME/.local/bin"
-          sops_ok() { [ -f "$1" ] && echo "$SOPS_SHA  $1" | sha256sum -c - >/dev/null 2>&1; }
-          if ! sops_ok "$SOPS_BIN"; then
-            rm -f "$SOPS_BIN"
-            curl -sSL -o "$SOPS_TMP" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
-            sops_ok "$SOPS_TMP" || { echo "::error::el sops $SOPS_VER recien descargado NO coincide con el checksum fijado"; rm -f "$SOPS_TMP"; exit 1; }
-            install -m 0755 "$SOPS_TMP" "$SOPS_BIN"
-            rm -f "$SOPS_TMP"
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          sops_ok "$SOPS_BIN" || { echo "::error::el sops $SOPS_VER de $SOPS_BIN NO coincide con el checksum fijado"; exit 1; }
-          ln -sf "$SOPS_BIN" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -1180,27 +1174,29 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
       - name: Install sops (pinned + checksum)
-        # Mismo pin y mismo checksum que el job `deploy` y que
-        # infra/.github/workflows/provision-env.yml.
+        # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         if: steps.secretos.outputs.present == 'true'
         run: |
           set -euo pipefail
           SOPS_VER=v3.11.0
           SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
-          SOPS_BIN="$HOME/.local/bin/sops-$SOPS_VER"
-          SOPS_TMP="${RUNNER_TEMP:-/tmp}/sops-$SOPS_VER.$$"
-          mkdir -p "$HOME/.local/bin"
-          sops_ok() { [ -f "$1" ] && echo "$SOPS_SHA  $1" | sha256sum -c - >/dev/null 2>&1; }
-          if ! sops_ok "$SOPS_BIN"; then
-            rm -f "$SOPS_BIN"
-            curl -sSL -o "$SOPS_TMP" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
-            sops_ok "$SOPS_TMP" || { echo "::error::el sops $SOPS_VER recien descargado NO coincide con el checksum fijado"; rm -f "$SOPS_TMP"; exit 1; }
-            install -m 0755 "$SOPS_TMP" "$SOPS_BIN"
-            rm -f "$SOPS_TMP"
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          sops_ok "$SOPS_BIN" || { echo "::error::el sops $SOPS_VER de $SOPS_BIN NO coincide con el checksum fijado"; exit 1; }
-          ln -sf "$SOPS_BIN" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       # SOPS_AGE_KEY (identidad ci-github-actions, secret de organización)
       # entra SÓLO por env y sólo acá: `sl secrets rotate` la usa para

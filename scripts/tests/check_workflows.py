@@ -127,11 +127,47 @@ def check_no_unverified_installs(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+def check_sops_is_verified_every_time(wfs: dict[str, dict]) -> list[str]:
+    """The sops that runs next to SOPS_AGE_KEY is downloaded into this job's
+    $RUNNER_TEMP and checksummed unconditionally. A copy cached in $HOME was
+    reused unverified whenever it existed (SEC-03, DEP-09(2), DEP-02(3))."""
+    errors = []
+    for name, job_id, step, run in run_scripts(wfs):
+        if "getsops/sops" not in run:
+            continue
+        where = f"{name}:{job_id}:{step}"
+        if "sha256sum -c" not in run:
+            errors.append(f"{where}: installs sops without a checksum")
+        if "$HOME" in run or ".local/bin" in run:
+            errors.append(f"{where}: installs sops into $HOME, which outlives the job")
+        if "RUNNER_TEMP" not in run:
+            errors.append(f"{where}: sops does not go to $RUNNER_TEMP")
+        if re.search(r"if \[ ! -[xf]", run):
+            errors.append(f"{where}: the checksum sits behind an 'is it cached?' test")
+    return errors
+
+
+def check_deploy_manual_deploys_the_tag(wfs: dict[str, dict]) -> list[str]:
+    """The fragment, descriptor and secrets pushed to the droplet are the
+    tag's, not the dispatch branch's (DEP-09(1))."""
+    job = jobs(wfs["deploy-manual.yml"]).get("deploy", {})
+    own = [s for s in steps(job) if str(s.get("uses", "")).startswith("actions/checkout@")
+           and "repository" not in (s.get("with") or {})]
+    if not own:
+        return ["deploy-manual.yml:deploy: no checkout of the app repo"]
+    ref = (own[0].get("with") or {}).get("ref")
+    if ref != "${{ inputs.tag }}":
+        return [f"deploy-manual.yml:deploy: the app checkout has ref {ref!r}, not the tag"]
+    return []
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
     check_pin_comments_agree,
     check_no_unverified_installs,
+    check_sops_is_verified_every_time,
+    check_deploy_manual_deploys_the_tag,
 ]
 
 

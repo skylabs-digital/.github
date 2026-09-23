@@ -68,7 +68,7 @@ rejects the name and prints the valid ones — it never deploys something that i
 | Input | Default | What it does |
 |---|---|---|
 | `environment` | — (required) | `qa` or `prod`. It is both the `sl deploy` environment and the GitHub Environment of the job. |
-| `tag` | — (required) | The image tag: `vX.Y.Z`, a commit sha, `latest`. Required on purpose — without one, compose falls back to `:latest`. |
+| `tag` | — (required) | A release, `vX.Y.Z`. It is both the image tag and the git ref that is checked out. `latest`, `qa-stable` or a sha are refused by the gate. |
 | `service` | `''` | One service name, or empty for the whole app. |
 | `confirm` | `''` | Must be exactly `prod` when `environment: prod`. |
 | `skip-migrate` | `false` | Full deploy without migrations (`sl deploy --skip-migrate`). |
@@ -76,8 +76,9 @@ rejects the name and prints the valid ones — it never deploys something that i
 | `node-version` | `24` | |
 | `runner-labels` | `["self-hosted","linux","x64","skylabs"]` | |
 
-Secrets are the same four the release pipeline uses and arrive through `secrets: inherit`:
-`GHCR_TOKEN`, `DEPLOY_SSH_KEY`, `SOPS_AGE_KEY`, `INFRA_READ_TOKEN`.
+Secrets are the ones the release pipeline uses and arrive through `secrets: inherit`:
+`GHCR_TOKEN`, `DEPLOY_SSH_KEY`, `SOPS_AGE_KEY`, and `SEMANTIC_RELEASE_APP_ID` /
+`SEMANTIC_RELEASE_PRIVATE_KEY` (a read-only token for the platform registry in `infra`).
 
 ## One service is not a small full deploy
 
@@ -91,15 +92,22 @@ re-registers the edge and the monitor.
 
 ## Which ref gets deployed
 
-The job does not pass a `ref:` to the checkout: it uses whatever you picked in the **Use workflow
-from** dropdown, which accepts branches *and tags*. Pick the same `vX.Y.Z` there that you type
-into `tag`, so the descriptor, the compose fragment and the encrypted secrets pushed to the
-droplet are the ones from that version rather than the tip of `main`.
+The tag. The job checks out `ref: <tag>`, so the descriptor, the compose fragment and the
+encrypted secrets pushed to the droplet are the ones of the release whose image is deployed.
+Until 2026-09-23 it checked out the **Use workflow from** branch, and an emergency rollback to an
+old tag dispatched from `main` shipped the old image with `main`'s compose and descriptor
+(DEP-09). `sl` 1.36 and later refuse a checkout that is not the tag's, so this is also what lets
+an app raise its `sl` pin.
+
+**Use workflow from** must be the default branch or a `v*` tag; any other branch is refused by
+the gate. The deploy job holds the deploy keys, so the caller that reaches it must be the
+reviewed one (SEC-01). What gets deployed comes from the tag either way.
 
 ## The prod gate
 
 A `guard` job — no `environment:`, so it costs nothing and wakes nobody — validates the
-environment name and, for prod, that `confirm` is exactly `prod`. It fails **red**, not
+environment name, the tag (`vX.Y.Z`), the ref the run was dispatched from and, for prod, that
+`confirm` is exactly `prod`. It fails **red**, not
 `skipped`: a whole run in green with everything skipped reads as "deployed" from the Actions
 list, which is the worst possible ending for a production deploy that did not happen.
 
