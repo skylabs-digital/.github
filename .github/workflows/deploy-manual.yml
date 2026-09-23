@@ -240,13 +240,16 @@ jobs:
     # hasta que alguien lo mate a mano. Un deploy real son minutos; 30 cubre el
     # completo (migraciones + servicios + borde + monitoreo) con aire.
     timeout-minutes: 30
-    # Un deploy a la vez por (entorno, servicio), y NUNCA se cancela a mitad:
-    # cancelar entre el `up` y el promote deja el droplet en un estado que nadie
-    # pidió. El release corre en su propio grupo (`release-*`) y podría solaparse
-    # con éste: la exclusión real la da el `flock` por app del lado del droplet
-    # (cli/src/deploy/plan.ts, conLock), no este grupo.
+    # Un deploy a la vez por (app, entorno), COMPARTIDO con el job `deploy` de
+    # app-release.yml, y NUNCA se cancela a mitad: cancelar entre el `up` y el
+    # promote deja el droplet en un estado que nadie pidió. Antes el grupo era
+    # por (entorno, servicio) y sólo de este workflow, confiando en el `flock`
+    # del droplet; pero ese lock dura UN comando, no el deploy entero, y un
+    # release podía swapear su fragmento+env en el medio (DEP-14(3)). GitHub
+    # guarda UN job pendiente por grupo: si se encolan dos detrás de uno que
+    # corre, el más viejo de los pendientes se cancela sin haber arrancado.
     concurrency:
-      group: deploy-manual-${{ inputs.environment }}-${{ inputs.service || 'app' }}
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
       # El tag, no la rama del dispatch (DEP-09): de acá salen

@@ -676,6 +676,15 @@ jobs:
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     timeout-minutes: 30
     environment: ${{ inputs.deploy-env }}
+    # One deploy at a time per (app, env), shared with deploy-manual.yml
+    # (DEP-14(3)). The droplet-side `flock` lasts ONE command, not the whole
+    # deploy: a manual deploy could swap its fragment+env between this
+    # deploy's swap and its `up`. Never cancelled mid-flight. GitHub keeps one
+    # PENDING job per group: a third deploy queued behind two replaces the
+    # waiting one (it shows as cancelled, and it never started).
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.deploy-env }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:

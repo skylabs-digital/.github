@@ -209,6 +209,24 @@ def check_latest_is_validated(wfs: dict[str, dict]) -> list[str]:
     return []
 
 
+def check_one_deploy_at_a_time_per_app_and_env(wfs: dict[str, dict]) -> list[str]:
+    """The release deploy and the manual deploy of the same app and env share
+    one concurrency group: the droplet-side lock lasts one command, not one
+    deploy (DEP-14(3))."""
+    want = {
+        ("app-release.yml", "deploy"): "deploy-${{ github.repository }}-${{ inputs.deploy-env }}",
+        ("deploy-manual.yml", "deploy"): "deploy-${{ github.repository }}-${{ inputs.environment }}",
+    }
+    errors = []
+    for (name, job_id), group in want.items():
+        conc = jobs(wfs[name])[job_id].get("concurrency") or {}
+        if not isinstance(conc, dict) or conc.get("group") != group:
+            errors.append(f"{name}:{job_id}: concurrency group is {conc!r}, want {group!r}")
+        elif conc.get("cancel-in-progress") is not False:
+            errors.append(f"{name}:{job_id}: a running deploy could be cancelled mid-flight")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -219,6 +237,7 @@ CHECKS = [
     check_rollback_only_when_the_deploy_failed,
     check_stable_retag_cannot_fail_a_deploy,
     check_latest_is_validated,
+    check_one_deploy_at_a_time_per_app_and_env,
 ]
 
 

@@ -117,7 +117,10 @@ reviewers are only asked about a deploy that is already well-formed.
 
 ## Concurrency
 
-One run at a time per (environment, service), never cancelled mid-flight — cancelling between the
-`up` and the promote leaves the droplet in a state nobody asked for. The release pipeline runs in
-its own `release-*` group and can overlap with this one; the real mutual exclusion is the
-per-app `flock` on the droplet, inside `sl deploy`.
+One deploy at a time per (app, environment), **shared with the release pipeline's `deploy` job**
+(`deploy-<owner/repo>-<env>`), and never cancelled mid-flight: cancelling between the `up` and the
+promote leaves the droplet in a state nobody asked for. The droplet-side `flock` inside
+`sl deploy` lasts one command, not one deploy, so it could not keep a release from swapping its
+fragment and env in the middle of a manual deploy (DEP-14). GitHub keeps one *pending* job per
+group: with two deploys queued behind a running one, the older waiting one is cancelled before it
+starts.
