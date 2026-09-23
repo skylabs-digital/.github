@@ -136,6 +136,14 @@ on:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages) para `yarn install` de los @skylabs-digital/* y el fallback del checkout de infra'
         required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
+        required: false
       DEPLOY_SSH_KEY:
         description: 'SSH key del usuario deploy en los droplets (se mapea a SL_SSH_KEY)'
         required: false
@@ -326,7 +334,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
       # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of

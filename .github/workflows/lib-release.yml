@@ -110,6 +110,14 @@ on:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages + write:packages) for private npm deps + GitHub Packages publish'
         required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
+        required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'GitHub App id for semantic-release-bot-skylabs'
         required: false
@@ -156,7 +164,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: Typecheck
         run: yarn typecheck
       - name: Lint
@@ -169,7 +177,7 @@ jobs:
         if: ${{ inputs.extra-ci-steps != '' }}
         run: ${{ inputs.extra-ci-steps }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: Test (coverage)
         run: yarn test --coverage
       - name: Build
@@ -180,7 +188,7 @@ jobs:
         if: ${{ inputs.extra-ci-steps-post-build != '' }}
         run: ${{ inputs.extra-ci-steps-post-build }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
   # ============================================================
   # STAGE 1 — MUTATION (Stryker incremental) — INFORMATIVE PARALLEL CHECK
@@ -213,7 +221,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       # Stryker's incremental mode only works if .stryker-tmp/incremental.json
       # survives between runs — the path is gitignored and the checkout is clean,
       # so without this cache every run is a FULL mutation run (sl-0oc; donor
@@ -284,7 +292,7 @@ jobs:
     name: Security (org reusable@v1)
     uses: skylabs-digital/.github/.github/workflows/security.yml@main
     secrets:
-      npm-token: ${{ secrets.GHCR_TOKEN }}
+      npm-token: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
   # ============================================================
   # STAGE 2 — SEMANTIC RELEASE (version + npm publish) — push:main only.
@@ -331,7 +339,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: Build
         run: yarn build
       # Retry-recalculando, la misma semantica que ya tiene el bumper de
@@ -390,4 +398,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}

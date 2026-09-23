@@ -371,6 +371,18 @@ def check_no_expressions_in_shell(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+def check_installs_prefer_the_read_token(wfs: dict[str, dict]) -> list[str]:
+    """Every use of GHCR_TOKEN (a PAT with write:packages) is a READ: an
+    install or a build secret. They all prefer NPM_READ_TOKEN when the org
+    defines it (DEP-11), so the write-capable PAT can leave every PR."""
+    errors = []
+    for name in wfs:
+        for n, line in enumerate(raw_lines(name), 1):
+            if "secrets.GHCR_TOKEN" in line and "secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN" not in line:
+                errors.append(f"{name}:{n}: GHCR_TOKEN without the NPM_READ_TOKEN preference")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -387,6 +399,7 @@ CHECKS = [
     check_untrusted_checkouts_keep_no_token,
     check_deploy_keys_stay_where_they_are,
     check_no_expressions_in_shell,
+    check_installs_prefer_the_read_token,
 ]
 
 

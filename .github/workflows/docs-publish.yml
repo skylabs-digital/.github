@@ -89,6 +89,14 @@ on:
       GHCR_TOKEN:
         description: 'Read access to the private @skylabs-digital/* npm packages'
         required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
+        required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'The org GitHub App, to ask the docs repo for a rebuild (optional: without it the site rebuilds on its 15-minute cron)'
         required: false
@@ -146,11 +154,11 @@ jobs:
         name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - if: steps.detect.outputs.publish == 'true'
         name: Resolve sl (the repo's pin, else cli-version, else 1.37.0)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
           CLI_VERSION: ${{ inputs.cli-version }}
           MIN_VERSION: '1.21.0'
           FALLBACK_VERSION: '1.37.0'

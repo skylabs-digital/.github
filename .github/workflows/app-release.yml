@@ -147,6 +147,14 @@ on:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages + write:packages) for private npm installs and the GHCR docker login. NOT for cloning repositories: read:packages cannot check out a private repo, so the registry checkout uses a GitHub App token instead.'
         required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
+        required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'GitHub App id for semantic-release-bot-skylabs (mints git-push token)'
         required: false
@@ -227,7 +235,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: yarn sl app services
         id: sl
         run: |
@@ -282,7 +290,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: CI (typecheck + lint + test + build)
         run: yarn ci
 
@@ -324,7 +332,7 @@ jobs:
       # npm-token, but that App token lacks read:packages → 403 Forbidden on the
       # private-package install (whole Grype matrix fails). The App token is only
       # needed by the version stage (commit/tag push), which mints its own.
-      npm-token: ${{ secrets.GHCR_TOKEN }}
+      npm-token: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
   # ============================================================
   # STAGE 2 — VERSION BUMP  (THE FORK POINT)
@@ -681,7 +689,7 @@ jobs:
             BUILD_COMMIT=${{ steps.commit.outputs.sha }}
             APP_VERSION=v${{ needs.version.outputs.version }}
           secrets: |
-            npm_token=${{ secrets.GHCR_TOKEN }}
+            npm_token=${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
           provenance: false
@@ -783,7 +791,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
       # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
@@ -1124,7 +1132,7 @@ jobs:
         if: steps.stack.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
       # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
@@ -1289,7 +1297,7 @@ jobs:
         if: steps.stack.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
       # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
@@ -1515,7 +1523,7 @@ jobs:
         if: steps.secretos.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       - name: Install sops (pinned + checksum)
         # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
