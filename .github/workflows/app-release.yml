@@ -734,6 +734,38 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
+      - name: Last good release (for the rollback)
+        id: last-good
+        continue-on-error: true
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          CI: 'true'
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          SERVICE: ''
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # What the droplet runs as last-good, BEFORE touching it. If this
+          # deploy fails, the rollback redeploys that release from its own
+          # checkout (DEP-04). Read-only (`sl deploy <env> status`); a failure
+          # here only means the rollback falls back to images-only.
+          SL_BIN="$(yarn bin sl 2>/dev/null || true)"
+          echo "sl_bin=${SL_BIN}" >> "$GITHUB_OUTPUT"
+          last=""
+          if out="$(SL_FORMAT=json yarn sl deploy "${DEPLOY_ENV}" status --json 2>/dev/null | tail -n 1)"; then
+            last="$(printf '%s' "$out" | jq -r --arg svc "${SERVICE}" '
+              [(.data.servicios // [])[] | select($svc == "" or .service == $svc) | .lastGood // empty]
+              | unique | if length == 1 then .[0] else "" end' 2>/dev/null || true)"
+          fi
+          if [[ "${last}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "${last}" != "${TAG}" ]; then
+            echo "tag=${last}" >> "$GITHUB_OUTPUT"
+            echo "last good release in ${DEPLOY_ENV}: ${last}"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Rollback::no single last-good release to restore (read: '${last}'). If this deploy fails, the rollback puts the images back but NOT the fragment and env of that release (DEP-04)."
+          fi
+
       - name: sl deploy ${{ inputs.deploy-env }} --tag v${{ needs.version.outputs.version }}
         id: sl-deploy
         env:
@@ -786,8 +818,10 @@ jobs:
             docker push "${IMAGE}:${DEPLOY_ENV}-stable"
           done
 
-      # El `Rollback on failure` NO necesita `SOPS_AGE_KEY`: `rollback` no
-      # descifra nada, sólo le pide al script que vuelva al último tag promovido.
+      # Qué: redeploy del último release bueno desde SU checkout (fragmento,
+      # env, borde y monitoreo de ese release, no sólo las imágenes: DEP-04),
+      # y si eso no se puede, el rollback de imágenes de siempre. Por eso
+      # ahora SÍ lleva SOPS_AGE_KEY: descifra el env de ese release.
       #
       # Cuándo: sólo si el paso `sl deploy` MISMO falló o se canceló.
       #   - `failure()` a secas revertía también un deploy bueno cuando fallaba
@@ -802,10 +836,54 @@ jobs:
         if: (failure() || cancelled()) && (steps.sl-deploy.outcome == 'failure' || steps.sl-deploy.outcome == 'cancelled')
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           SL_FORMAT: text
           CI: 'true'
-        run: yarn sl deploy "${{ inputs.deploy-env }}" rollback
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          SERVICE: ''
+          DEPLOY_OUTCOME: ${{ steps.sl-deploy.outcome }}
+          LAST_GOOD: ${{ steps.last-good.outputs.tag }}
+          SL_BIN: ${{ steps.last-good.outputs.sl_bin }}
+        run: |
+          set -euo pipefail
+          images_only() {
+            local args=("${DEPLOY_ENV}" rollback)
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            yarn sl deploy "${args[@]}"
+          }
+          echo "::warning::the deploy ${DEPLOY_OUTCOME}: rolling back ${SERVICE:-the app} in ${DEPLOY_ENV}"
+
+          # A cancellation (job timeout, manual cancel) leaves minutes, not a
+          # full redeploy: images only. Same when there is nothing to restore.
+          if [ "${DEPLOY_OUTCOME}" = "cancelled" ] || [ -z "${LAST_GOOD}" ] || [ -z "${SL_BIN}" ]; then
+            echo "::warning::images-only rollback: the droplet keeps the fragment and env of the failed release (DEP-04)."
+            images_only
+            exit 0
+          fi
+
+          # Redeploy the last-good release from ITS checkout: its images, its
+          # compose fragment, its env (decrypted from its deploy/secrets), its
+          # edge and monitoring. The images-only rollback swapped the images
+          # back under the NEW fragment and env (appoint run 35770492946).
+          # `--skip-migrate`: a migration is not reverted, and the old
+          # migrator has nothing to add. The CURRENT `sl` runs it: an older
+          # descriptor read by a newer `sl` is the compatible direction.
+          WT="${RUNNER_TEMP}/last-good-${LAST_GOOD}"
+          if git fetch --quiet --depth=1 origin "refs/tags/${LAST_GOOD}:refs/tags/${LAST_GOOD}" \
+             && git worktree add --quiet --detach "${WT}" "${LAST_GOOD}"; then
+            args=("${DEPLOY_ENV}")
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            args+=(--tag "${LAST_GOOD}" --skip-migrate)
+            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}"); then
+              echo "::warning::rolled back to ${LAST_GOOD}: images, fragment, env, edge and monitoring of that release. Migrations already applied stay applied."
+              exit 0
+            fi
+            echo "::error::redeploying ${LAST_GOOD} failed: falling back to the images-only rollback"
+          else
+            echo "::error::could not check out ${LAST_GOOD}: falling back to the images-only rollback"
+          fi
+          images_only
 
   # ============================================================
   # STAGE 5 — CaC (configuration as code)

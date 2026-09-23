@@ -31,7 +31,7 @@ flowchart TD
 | `security` | every event but `repository_dispatch` | Calls [`security.yml@main`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
 | `version` | push to `main`, not on the bumper's own `chore(release): v…` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
 | `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`, where `<sha>` (and the `BUILD_COMMIT` build-arg) is the commit the tag points at. |
-| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable`. On failure, `sl deploy <env> rollback`. |
+| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable` (a failed retag only warns). If `sl deploy` itself fails or is cancelled, it rolls back — see [Rollback](#rollback). |
 | `cac-plan` | pull requests | `yarn cac plan --env <env>` when the repo has `cac/stack.ts`. |
 | `cac-apply` | after a successful (or skipped) deploy | `yarn cac apply --env <env> --no-create-keys` when the repo has `cac/stack.ts`. |
 | `secrets-rotate` | `repository_dispatch: skylabs-operators-changed` only | Re-encrypts `deploy/secrets/*.env` for the current operators (`yarn sl secrets rotate`) and commits `chore(secrets): recipients del registro [skip ci]`. |
@@ -69,6 +69,25 @@ started for, and the new commits trigger CI, the run publishes nothing and ends 
 `secrets-rotate` commit), no newer run will come, so the job recomputes on top of them — up to
 five times. When a concurrent release already covered everything, it exits cleanly with no
 release.
+
+## Rollback
+
+Before deploying, the job reads what the droplet runs as last-good (`sl deploy <env> status`).
+When `sl deploy` fails, the rollback **redeploys that release from its own checkout** —
+`sl deploy <env> --tag <last-good> --skip-migrate` in a worktree of the last-good tag — so the
+images, the compose fragment, the env, the edge and the monitoring all go back together.
+The plain `sl deploy <env> rollback` only swapped the images, under the fragment and env of the
+release that failed (DEP-04: appoint run 35770492946).
+
+It falls back to the images-only rollback when:
+
+- the deploy was **cancelled** (a timeout leaves minutes, not a full redeploy);
+- the services do not agree on a single last-good `vX.Y.Z`, or it could not be read;
+- the redeploy of the last-good release fails.
+
+Migrations are never reverted: a migration must stay compatible with the previous image
+(expand/contract). The rollback only runs when the `sl deploy` step itself failed; a failure
+after it (the `<env>-stable` retag) does not undo a good deploy.
 
 ## Inputs
 
