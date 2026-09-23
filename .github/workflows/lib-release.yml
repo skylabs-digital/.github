@@ -334,7 +334,22 @@ jobs:
       # react-proto-kit 16:23); plan en
       # skylabs/docs/analyses/2026-09-02-plan-release-y-versionado-flota.md.
       - name: Semantic release
+        #
+        # Pero solo publica lo que ESTE run valido (DEP-03, mismo criterio que el
+        # bumper de app-release.yml): si main avanzo con commits que disparan
+        # CI, este run no publica y sale verde; el run del commit mas nuevo
+        # valida y publica todo. Solo se recalcula sobre origin/main cuando lo
+        # que avanzo son commits `[skip ci]` (por los que no va a correr ningun
+        # run que los publique).
         run: |
+          only_skip_ci() {
+            local sha
+            for sha in $(git rev-list "$1..$2"); do
+              git log -1 --format=%B "$sha" \
+                | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]' || return 1
+            done
+          }
+          BASE="${GITHUB_SHA}"
           for attempt in 1 2 3; do
             # Exact version (SEC-12(3)): an unpinned `yarn dlx` runs whatever
             # npm says is latest today, with the App token in the environment.
@@ -343,11 +358,17 @@ jobs:
               exit 0
             fi
             git fetch --tags --force --prune --prune-tags --quiet origin main
-            if git merge-base --is-ancestor origin/main HEAD; then
+            REMOTE="$(git rev-parse origin/main)"
+            if [ "${REMOTE}" = "${BASE}" ]; then
               echo "::error::semantic-release fallo y main no se movio (intento ${attempt}): fallo real, no se reintenta"
               exit 1
             fi
-            echo "::warning::main se movio durante el release (intento ${attempt}): se descarta el intento y se recalcula contra origin/main"
+            if ! only_skip_ci "${BASE}" "${REMOTE}"; then
+              echo "::notice title=Release superseded::main advanced past ${BASE} (now ${REMOTE}) with commits this run did not validate. Nothing published here: the run of the newer commit releases everything."
+              exit 0
+            fi
+            echo "::warning::main avanzo solo con commits [skip ci] durante el release (intento ${attempt}): se descarta el intento y se recalcula contra origin/main"
+            BASE="${REMOTE}"
             git reset --hard --quiet origin/main
             NODE_AUTH_TOKEN="${GHCR_TOKEN}" yarn install --immutable
             yarn build

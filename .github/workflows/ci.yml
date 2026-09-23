@@ -106,6 +106,7 @@ jobs:
         run: |
           archivos=()
           ls scripts/*.sh >/dev/null 2>&1 && archivos+=(scripts/*.sh)
+          ls scripts/tests/*.sh >/dev/null 2>&1 && archivos+=(scripts/tests/*.sh)
           [ -f bootstrap.sh ] && archivos+=(bootstrap.sh)
           if [ ${#archivos[@]} -gt 0 ]; then
             docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:v0.11.0 "${archivos[@]}"

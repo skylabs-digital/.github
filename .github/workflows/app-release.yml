@@ -74,7 +74,8 @@ name: App Release (reusable)
 # Every image built is built with two build-args, guaranteed:
 #
 #   APP_VERSION=vX.Y.Z      the version the `version` job just computed and tagged
-#   BUILD_COMMIT=<sha>      the exact main commit being built
+#   BUILD_COMMIT=<sha>      the exact commit being built: the one tag vX.Y.Z
+#                           points at (the release commit), not github.sha
 #
 # A Dockerfile that wants them declares `ARG APP_VERSION` / `ARG BUILD_COMMIT`
 # and fixes them as `ENV`; one that does not declare them silently ignores them
@@ -457,10 +458,51 @@ jobs:
             echo "version=" >> $GITHUB_OUTPUT
           }
 
+          # EL RUN SOLO PUBLICA LO QUE VALIDO (DEP-03, pre-mortem de despliegue
+          # 2026-09-23). `static-checks`, Gitleaks y OSV corrieron sobre
+          # GITHUB_SHA. Si `main` ya esta mas alla de GITHUB_SHA, recalcular
+          # sobre `origin/main` publicaba commits que ningun run valido en main:
+          # idachu run 35804850323 salio como v5.26.0 con bb1e3c0 y 31e1704
+          # adentro, que solo pasaron por su PR sobre otra base.
+          #
+          # Asi que, si main se movio:
+          #   - con al menos un commit que dispara CI: este run NO publica. Sale
+          #     verde con bumped=false. El run del commit mas nuevo publica todo:
+          #     GitHub solo cancela los runs *pending* viejos, nunca el mas nuevo,
+          #     y su static-checks cubre ese HEAD.
+          #   - solo con commits `[skip ci]` (una rotacion de recipients de
+          #     `secrets-rotate`, un release de otro run): NO va a haber un run
+          #     mas nuevo que publique, asi que se recalcula sobre origin/main
+          #     como antes. Esos commits se eximieron de CI a proposito.
+          main_moved_only_by_skip_ci() {
+            local from="$1" to="$2" sha msg
+            for sha in $(git rev-list "${from}..${to}"); do
+              msg="$(git log -1 --format=%B "$sha")"
+              if ! printf '%s' "$msg" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then
+                return 1
+              fi
+            done
+            return 0
+          }
+
+          superseded() {
+            local remote="$1"
+            echo "::notice title=Release superseded::main advanced past ${GITHUB_SHA} (now ${remote}) with commits this run did not validate. Nothing published here: the run of the newer commit releases everything."
+            {
+              echo "### Sin release: lo publica un run más nuevo"
+              echo ""
+              echo "main avanzó de \`${GITHUB_SHA}\` a \`${remote}\` mientras este run esperaba o corría,"
+              echo "con commits que este run no validó (DEP-03). The newer run releases them."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          }
+
           # Push el commit de release y su tag ATOMICAMENTE. Si lo rechazan
           # porque `main` se movio, NO se reintenta rebasando el MISMO commit:
-          # se descarta, se refresca `origin/main`, y se RECALCULA la version
-          # entera desde cero contra la base real.
+          # se descarta, se refresca `origin/main`, y se decide segun lo de
+          # arriba. Si `main` no se movio (el rechazo fue por un tag que otro
+          # run publico), se RECALCULA la version entera desde cero.
           #
           # Por que. Dos releases que arrancan casi juntos parten del mismo
           # `CURRENT` y terminan tocando las MISMAS lineas de version en
@@ -478,18 +520,35 @@ jobs:
           # evita nombres de tag repetidos: no se entera de que el archivo
           # que esta por commitear ya lo toco el release concurrente.
           #
-          # Recalcular desde `origin/main` fresco convierte el caso comun (el
-          # concurrente ya libero todo esto) en un no-op limpio —
-          # `compute_release` devuelve 1 porque el rango `LAST_TAG..HEAD` ya
-          # no tiene nada liberable — y el caso raro (el concurrente liberaba
-          # ALGO pero no todo) en un bump correcto sobre la base real, en vez
-          # de un commit corrupto o un conflicto que bloquea el pipeline.
+          # Recalcular (sobre GITHUB_SHA, o sobre un main que solo avanzo con
+          # `[skip ci]`) convierte el caso comun (el concurrente ya libero todo
+          # esto) en un no-op limpio — `compute_release` devuelve 1 porque el
+          # rango `LAST_TAG..HEAD` ya no tiene nada liberable — y el caso raro
+          # (el concurrente liberaba ALGO pero no todo) en un bump correcto
+          # sobre la base real, en vez de un commit corrupto o un conflicto que
+          # bloquea el pipeline. Un main que avanzo con codigo nuevo no se
+          # recalcula: lo publica su propio run (DEP-03, arriba).
           PUSHED=false
+          BASE="${GITHUB_SHA}"
           for attempt in 1 2 3 4 5; do
-            if [ "$attempt" -gt 1 ]; then
-              echo "Intento ${attempt}: descartando el commit de release anterior y recalculando contra origin/main"
-              git fetch --quiet origin main
-              git reset --hard origin/main
+            git fetch --quiet origin main
+            REMOTE="$(git rev-parse FETCH_HEAD)"
+            if [ "$REMOTE" != "$BASE" ]; then
+              if ! git merge-base --is-ancestor "$BASE" "$REMOTE"; then
+                echo "::error::origin/main (${REMOTE}) no desciende de ${BASE}: alguien reescribio main. No se publica nada."
+                exit 1
+              fi
+              if main_moved_only_by_skip_ci "$BASE" "$REMOTE"; then
+                echo "main avanzo solo con commits [skip ci] (${BASE}..${REMOTE}): se recalcula sobre ${REMOTE}"
+                BASE="$REMOTE"
+              else
+                superseded "$REMOTE"
+                exit 0
+              fi
+            fi
+            if [ "$attempt" -gt 1 ] || [ "$(git rev-parse HEAD)" != "$BASE" ]; then
+              echo "Intento ${attempt}: descartando el commit de release anterior y recalculando sobre ${BASE}"
+              git reset --hard --quiet "$BASE"
               # El tag LOCAL del intento anterior sobrevive al reset (`reset
               # --hard` solo mueve la rama y el working tree) y confundiria al
               # guard de colision de `compute_release`, que lo veria como si
@@ -551,6 +610,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: v${{ needs.version.outputs.version }}
+      # The commit the image is built FROM: the one the tag points at (the
+      # release commit on top of what `version` validated), not
+      # `github.sha`. They differed whenever `version` recalculated on a
+      # newer main (DEP-03(2)): the image said BUILD_COMMIT=A while its
+      # content was C + bump.
+      - name: Commit of the tag
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
       - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
         with:
@@ -564,10 +631,10 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:v${{ needs.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ steps.commit.outputs.sha }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:latest
           build-args: |
-            BUILD_COMMIT=${{ github.sha }}
+            BUILD_COMMIT=${{ steps.commit.outputs.sha }}
             APP_VERSION=v${{ needs.version.outputs.version }}
           secrets: |
             npm_token=${{ secrets.GHCR_TOKEN }}
