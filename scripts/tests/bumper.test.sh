@@ -101,4 +101,21 @@ run_bump "$d" "$A"
 parent="$(git --git-dir="$d/origin.git" rev-parse 'v1.0.1^{commit}^' 2>/dev/null || true)"
 [ "$parent" = "$S" ] && pass "released on top of the [skip ci] commit" || fail "release parent ${parent}, expected ${S}"
 
+# ---------------------------------------------------------------------------
+CURRENT_TEST="DEP-20: a subject with a backslash does not truncate the CHANGELOG"
+d="${WORK_ROOT}/t4"; mkdir -p "$d"; new_origin "$d"
+A="$(commit_on_origin "$d" 'fix: handle C:\config paths and trailing text')"
+run_bump "$d" "$A"
+[ "$BUMP_RC" -eq 0 ] || fail "exit ${BUMP_RC}: $(cat "$d/log")"
+changelog="$(git --git-dir="$d/origin.git" show v1.0.1:CHANGELOG.md)"
+case "$changelog" in
+  *'C:\config paths and trailing text'*) pass "the subject survives verbatim" ;;
+  *) fail "CHANGELOG lost the subject: ${changelog}" ;;
+esac
+case "$changelog" in
+  *'## [1.0.0] - 2026-01-01'*) pass "the previous entries survive" ;;
+  *) fail "CHANGELOG lost the history: ${changelog}" ;;
+esac
+
+
 finish

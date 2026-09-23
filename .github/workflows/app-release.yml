@@ -320,7 +320,7 @@ jobs:
     if: |
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      !contains(github.event.head_commit.message, 'chore(release):')
+      !startsWith(github.event.head_commit.message, 'chore(release): v')
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     timeout-minutes: 10
     outputs:
@@ -424,12 +424,15 @@ jobs:
             else
               RANGE_COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline --pretty=format:"- %s (%h)")
             fi
-            ENTRY="## [${NEW}] - ${DATE}\n\n${RANGE_COMMITS}\n"
-            if [ -f CHANGELOG.md ]; then
-              echo -e "# Changelog\n\n${ENTRY}\n$(tail -n +2 CHANGELOG.md)" > CHANGELOG.md
-            else
-              echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
-            fi
+            # `printf '%s'`, never `echo -e`: the subjects are user text, and
+            # `echo -e` interprets them — a `\c` in a subject (`C:\config`)
+            # stopped the output right there and the bumper committed a
+            # CHANGELOG cut at that byte, history included (DEP-20).
+            {
+              printf '# Changelog\n\n## [%s] - %s\n\n%s\n\n' "$NEW" "$DATE" "$RANGE_COMMITS"
+              if [ -f CHANGELOG.md ]; then tail -n +2 CHANGELOG.md; fi
+            } > CHANGELOG.md.new
+            mv CHANGELOG.md.new CHANGELOG.md
 
             git add -A
             git commit -m "chore(release): v${NEW} [skip ci]"
