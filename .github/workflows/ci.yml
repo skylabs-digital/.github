@@ -92,6 +92,13 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # Invariants actionlint cannot express (SHA pins, permissions, where the
+      # deploy keys may appear) and behaviour tests that run the REAL `run:`
+      # of a step against throwaway git repos (the bumper, the ssh pinning).
+      # PyYAML is already there from the step above.
+      - name: Workflow invariants + behaviour tests
+        run: bash scripts/tests/run-all.sh
+
       # bootstrap.sh se sirve por raw.githubusercontent y se corre con `curl | bash`
       # en las máquinas del equipo: es el shell de este repo que más caro sale
       # romper, así que entra al mismo gate que scripts/.
