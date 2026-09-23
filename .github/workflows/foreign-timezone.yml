@@ -1,0 +1,179 @@
+name: Foreign timezone (reusable)
+
+# ============================================================================
+# The repo's test suite, once more, with the process clock somewhere that is
+# neither production (UTC) nor the business (America/Argentina/Buenos_Aires).
+#
+# Standard: skylabs/docs/standards/locale-currency-and-time.md (R8, R8b).
+# Analysis: skylabs/docs/analyses/2026-09-22-locale-moneda-y-zona-horaria.md.
+# Generalised from appoint/.github/workflows/timezone.yml, whose header
+# documents the two real bugs that justified it (appoint-m56w, appoint-1b7w).
+#
+# WHY A FOREIGN ZONE AND NOT UTC. A test that computes an instant the wrong way
+# and asserts it the same wrong way is self-consistent. Under UTC the whole
+# class is invisible: a host-local getter and its UTC twin return the same
+# number, a naive '2026-09-22 15:00:00' parses to the instant it denotes, and a
+# calendar day never straddles a boundary. Production is UTC, so "pin UTC, same
+# as prod" is the one choice that guarantees nothing is found. ART hides it
+# too — the team works in ART. resuelto shipped ~10 timezone bugs green in
+# September 2026 (several of them money) with suites that ran under both.
+#
+# WHY Asia/Tokyo. UTC+9 is 9 hours from production and 12 from the business,
+# so for part of every day the calendar date differs from BOTH. It has no DST:
+# a red run is a real bug, not a March/October artifact.
+#
+# THE `pool: 'threads'` TRAP. Vitest's `test.env.TZ` is applied inside the
+# worker thread, and Node only re-reads the zone when TZ changes on a
+# process's main thread: `process.env.TZ` reads back as Asia/Tokyo while the
+# clock never moved (measured in resuelto, vitest 4.1.11). This job sets TZ in
+# the PROCESS environment of the job instead, which every child process and
+# thread inherits before it starts — that works under any pool. And it does
+# not trust the variable: the first step renders two fixed instants and fails
+# if the wall clock is not where TZ says it is.
+#
+# THIS IS THE FLOOR, NOT THE GOAL. The preferred adoption is the pin as the
+# DEFAULT of every Vitest config (`pinTestTimezone()` + a setupFiles check, as
+# resuelto does): it then runs on every local `yarn test` and in the pre-push
+# hook at no extra cost. This job is for repos that have not done that yet; it
+# catches the bug in CI only, and costs one more runner per PR.
+#
+# ----------------------------------------------------------------------------
+# HOW A CONSUMING REPO CALLS THIS (`.github/workflows/timezone.yml`):
+#
+#   name: Timezone
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#   concurrency:
+#     group: timezone-${{ github.ref }}
+#     cancel-in-progress: true
+#   jobs:
+#     foreign-timezone:
+#       uses: skylabs-digital/.github/.github/workflows/foreign-timezone.yml@main
+#       with:
+#         test-command: yarn test
+#       secrets: inherit
+#
+# `secrets: inherit` passes GHCR_TOKEN for the `@skylabs-digital/*` install.
+# Needs nothing beyond `contents: read`: this reusable declares no
+# `permissions:` of its own (a reusable that asks for more than its caller
+# granted fails at startup on every event).
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      time-zone:
+        description: 'IANA zone the suite runs in. Must differ from both UTC and America/Argentina/Buenos_Aires, or the job refuses to run.'
+        type: string
+        default: 'Asia/Tokyo'
+      test-command:
+        description: 'Shell that runs the suite. Every child process inherits TZ from the job.'
+        type: string
+        default: 'yarn test'
+      setup-command:
+        description: 'Shell run after install and before the tests — e.g. building the workspaces the tests import. Empty = skipped.'
+        type: string
+        default: ''
+      node-version:
+        description: 'Node version'
+        type: string
+        default: '24'
+      runner-labels:
+        description: 'JSON array of runner labels'
+        type: string
+        default: '["self-hosted","linux","x64","skylabs"]'
+      timeout-minutes:
+        description: 'Job timeout. The suite runs once, whole.'
+        type: number
+        default: 30
+    secrets:
+      GHCR_TOKEN:
+        description: 'Token with read:packages for the private @skylabs-digital/* npm deps'
+        required: false
+
+# Same reason as lib-release.yml: hooks installed by `postinstall` must not run
+# on the runner. CI is the gate here.
+env:
+  HUSKY: 0
+
+jobs:
+  foreign-timezone:
+    if: github.actor != 'dependabot[bot]'
+    name: Tests under a foreign timezone (${{ inputs.time-zone }})
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      # Job-level, i.e. the PROCESS environment of every step — the mechanism
+      # that pins under `pool: 'threads'` too. See the header.
+      TZ: ${{ inputs.time-zone }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # Before setup-node, not after: `cache: yarn` makes the action run
+      # `yarn cache dir`, and a global yarn 1 refuses to run in a project whose
+      # `packageManager` says yarn 4.
+      - run: corepack enable
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@skylabs-digital'
+          cache: yarn
+
+      # Right after setup-node (so the Node that checks is the Node that tests)
+      # and before install: a zone that did not apply, or one that hides the
+      # bug class, fails in seconds instead of after a full install.
+      - name: Confirm the clock is actually elsewhere
+        run: |
+          node <<'JS'
+            const declared = process.env.TZ;
+            const probes = [new Date("2026-01-15T12:00:00Z"), new Date("2026-07-15T12:00:00Z")];
+            // Rendered wall clocks, not IANA ids: Intl canonicalises aliases
+            // (America/Argentina/Buenos_Aires -> America/Buenos_Aires), so an
+            // id comparison reports mismatches that do not exist.
+            // One probe per hemisphere-summer, so a zone with DST cannot pass
+            // on the half of the year it happens to differ.
+            const wallAt = (timeZone) => probes.map((p) => new Intl.DateTimeFormat("en-US", {
+              timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+              hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+            }).format(p));
+            const wall = (timeZone) => wallAt(timeZone).join(" | ");
+            let want;
+            try { want = wall(declared); } catch {
+              console.error(`::error::"${declared}" is not a timezone this runtime knows. Use an IANA id.`);
+              process.exit(1);
+            }
+            const got = wall(undefined);
+            console.log(`TZ = ${declared} | clock = ${Intl.DateTimeFormat().resolvedOptions().timeZone} | offset = ${new Date().getTimezoneOffset()}`);
+            if (got !== want) {
+              console.error(`::error::TZ says ${declared} but the clock renders ${got} (expected ${want}). The timezone did not apply.`);
+              process.exit(1);
+            }
+            const wantAt = wallAt(declared);
+            for (const hidden of ["UTC", "America/Argentina/Buenos_Aires"]) {
+              if (wallAt(hidden).some((w, i) => w === wantAt[i])) {
+                console.error(`::error::${declared} renders the same wall clock as ${hidden} for part of the year: under it this bug class is invisible. Pick a zone that differs from both all year (default: Asia/Tokyo).`);
+                process.exit(1);
+              }
+            }
+          JS
+
+      - name: Install
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Setup
+        if: ${{ inputs.setup-command != '' }}
+        run: ${{ inputs.setup-command }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Test
+        run: ${{ inputs.test-command }}

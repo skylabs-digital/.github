@@ -25,6 +25,7 @@ permissions, then hands the whole pipeline to one of these.
 | [`security.yml`](./security.md) | the two above, and repos with no release pipeline | OSV-Scanner, Gitleaks, Grype, a weekly rolling issue |
 | [`docs-publish.yml`](./docs-publish.md) | every repo with `docs/public/` | announces the docs section and publishes the pages, with its own `sl` and the job's OIDC token |
 | [`deploy-manual.yml`](./deploy-manual.md) | apps, on demand | the Actions button that deploys a chosen tag — one `sl deploy`, no second deploy implementation |
+| [`foreign-timezone.yml`](./foreign-timezone.md) | repos whose Vitest configs do not pin `TZ` yet | runs the whole suite again under `Asia/Tokyo`, neither UTC nor ART, after checking the clock really moved |
 
 ```mermaid
 flowchart LR
