@@ -318,6 +318,56 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
+      # SSH HOST KEYS PINNED, NOT TOFU (DEP-10). `sl` connects with
+      # `StrictHostKeyChecking=accept-new` against the runner's persistent
+      # ~/.ssh/known_hosts: the first contact accepts ANY key (a MITM there is
+      # silent) and, after the QA reset recreates a droplet on the same IP,
+      # the old key makes every deploy die with "Host key verification failed"
+      # until someone cleans nine hosts by hand.
+      #
+      # This step puts an `ssh` in front of the real one, for this job only,
+      # that forces `StrictHostKeyChecking=yes` against a known_hosts written
+      # to $RUNNER_TEMP. ssh keeps the FIRST value of each option, so ours win
+      # over `sl`'s `accept-new`; and `sl`'s ProxyCommand (the bastion hop)
+      # runs `ssh` through PATH too, so both hops are pinned. Sources, in order:
+      #   1. registry/known_hosts in infra (the sparse checkout above): what
+      #      infra would publish on every apply, so it survives recreation;
+      #   2. the DEPLOY_KNOWN_HOSTS variable (org, repo or environment);
+      #   3. neither: today's behaviour, with a warning.
+      # The format is plain known_hosts: `10.10.10.2 ssh-ed25519 AAAA…` for a
+      # droplet, `[bastion.host]:2222 ssh-ed25519 AAAA…` for the bastion.
+      - name: Pin SSH host keys
+        env:
+          KNOWN_HOSTS_VAR: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          REGISTRY_KNOWN_HOSTS: ${{ github.workspace }}/.infra-registry/registry/known_hosts
+        run: |
+          set -euo pipefail
+          if [ -s "${REGISTRY_KNOWN_HOSTS}" ]; then
+            src="registry/known_hosts (infra)"
+            content="$(cat "${REGISTRY_KNOWN_HOSTS}")"
+          elif [ -n "${KNOWN_HOSTS_VAR}" ]; then
+            src="the DEPLOY_KNOWN_HOSTS variable"
+            content="${KNOWN_HOSTS_VAR}"
+          else
+            echo "::warning title=SSH host keys not pinned::neither infra's registry/known_hosts nor the DEPLOY_KNOWN_HOSTS variable exist: ssh trusts on first use (accept-new) against this runner's persistent known_hosts (DEP-10)."
+            exit 0
+          fi
+          real_ssh="$(command -v ssh)"
+          dir="${RUNNER_TEMP}/ssh-pinned"
+          mkdir -p "${dir}/bin"
+          printf '%s\n' "${content}" > "${dir}/known_hosts"
+          if ! ssh-keygen -l -f "${dir}/known_hosts" >/dev/null 2>&1; then
+            echo "::error title=SSH host keys::${src} has no valid known_hosts line. Fix it, or remove it to fall back to trust-on-first-use."
+            exit 1
+          fi
+          cat > "${dir}/bin/ssh" <<EOF
+          #!/bin/sh
+          exec "${real_ssh}" -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${dir}/known_hosts" -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no "\$@"
+          EOF
+          chmod 0755 "${dir}/bin/ssh"
+          echo "${dir}/bin" >> "$GITHUB_PATH"
+          echo "SSH host keys pinned from ${src}: $(ssh-keygen -l -f "${dir}/known_hosts" | wc -l | tr -d ' ') key(s)"
+
       - name: Last good release (for the rollback)
         id: last-good
         if: inputs.rollback-on-failure

@@ -89,6 +89,23 @@ Migrations are never reverted: a migration must stay compatible with the previou
 (expand/contract). The rollback only runs when the `sl deploy` step itself failed; a failure
 after it (the `<env>-stable` retag) does not undo a good deploy.
 
+## SSH host keys
+
+`sl` connects with `StrictHostKeyChecking=accept-new` against the runner's persistent
+`known_hosts`: the first contact trusts any key, and a droplet recreated on the same IP (the QA
+reset) breaks every deploy with *Host key verification failed*. The deploy jobs therefore pin the
+host keys for the job's own `ssh`, both hops included (the bastion's `ProxyCommand` finds `ssh`
+through the same `PATH`), with `StrictHostKeyChecking=yes`. The keys come from, in order:
+
+1. `registry/known_hosts` in `infra` (the registry the job already checks out), which infra can
+   republish on every apply so it survives droplet recreation;
+2. the `DEPLOY_KNOWN_HOSTS` Actions variable (organization, repository or environment);
+3. neither: trust on first use, as before, with a warning on the run.
+
+The format is plain `known_hosts`: `10.10.10.2 ssh-ed25519 AAAA…` for a droplet and
+`[bastion.example]:2222 ssh-ed25519 AAAA…` for a bastion on another port. A value with no valid
+line fails the deploy.
+
 ## Inputs
 
 | Input | Type | Default | Meaning |

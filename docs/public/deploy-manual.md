@@ -103,6 +103,11 @@ an app raise its `sl` pin.
 the gate. The deploy job holds the deploy keys, so the caller that reaches it must be the
 reviewed one (SEC-01). What gets deployed comes from the tag either way.
 
+## SSH host keys
+
+The deploy pins the droplets' and the bastion's host keys the same way the release does — see
+[SSH host keys](./app-release.md#ssh-host-keys).
+
 ## The prod gate
 
 A `guard` job — no `environment:`, so it costs nothing and wakes nobody — validates the
