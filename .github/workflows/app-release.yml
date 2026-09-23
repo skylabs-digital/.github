@@ -388,6 +388,13 @@ jobs:
               BUMP=minor
             elif printf '%s\n' "$SUBJECTS" | grep -qiE '^(fix|perf|refactor)(\([^)]+\))?:'; then
               BUMP=patch
+            # Dependency bumps and reverts change what runs, so they ship too
+            # (DEP-12): a security bump that lands as `chore(deps)` used to
+            # leave QA on the vulnerable version, with every check green, until
+            # the next feat/fix. `(deps…)` is Dependabot's scope (`deps`,
+            # `deps-dev`); `Revert "…"` is what GitHub's revert button writes.
+            elif printf '%s\n' "$SUBJECTS" | grep -qiE '^((chore|build)\(deps(-dev)?\)|revert(\([^)]+\))?):|^revert "'; then
+              BUMP=patch
             else
               return 1
             fi
@@ -561,7 +568,7 @@ jobs:
 
             if ! compute_release; then
               if [ "$attempt" -eq 1 ]; then
-                no_releasable_commits "Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor, y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
+                no_releasable_commits "Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor / revert, chore(deps) y build(deps), y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
               else
                 no_releasable_commits "Un release concurrente ya cubrio todo lo que este intento iba a liberar: NO se construyo ni desplego nada de mas."
               fi

@@ -29,8 +29,8 @@ flowchart TD
 | `matrix` | every event but `repository_dispatch` | `yarn sl app services --json` reads the services from the descriptor. The list drives the build matrix and the images Grype scans. |
 | `static-checks` | pull requests and pushes | `yarn ci` once, repo-wide: typecheck, lint, test, build. |
 | `security` | every event but `repository_dispatch` | Calls [`security.yml@main`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
-| `version` | push to `main`, not on a `chore(release):` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
-| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`. |
+| `version` | push to `main`, not on the bumper's own `chore(release): v…` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
+| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`, where `<sha>` (and the `BUILD_COMMIT` build-arg) is the commit the tag points at. |
 | `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable`. On failure, `sl deploy <env> rollback`. |
 | `cac-plan` | pull requests | `yarn cac plan --env <env>` when the repo has `cac/stack.ts`. |
 | `cac-apply` | after a successful (or skipped) deploy | `yarn cac apply --env <env> --no-create-keys` when the repo has `cac/stack.ts`. |
@@ -56,12 +56,19 @@ The `version` job is the only place a version number is decided.
 |---|---|
 | Any type with `!` (`feat!:`, `fix(api)!:`) or a `BREAKING CHANGE:` footer | major |
 | `feat` | minor |
-| `fix`, `perf`, `refactor` | patch |
+| `fix`, `perf`, `refactor`, `revert` (and GitHub's `Revert "…"`) | patch |
+| `chore(deps)`, `chore(deps-dev)`, `build(deps)`, `build(deps-dev)` | patch — a dependency bump changes what runs |
 | Anything else (`chore`, `docs`, `test`…) | no release — nothing is built or deployed |
 
-If the tag already exists it bumps the patch until it finds a free one. If `main` moves while it
-pushes, it discards its commit, resets to the fresh `main` and **recomputes** — up to five
-times. When a concurrent release already covered everything, it exits cleanly with no release.
+If the tag already exists it bumps the patch until it finds a free one.
+
+**A run only publishes what it validated.** If `main` has moved past the commit the run was
+started for, and the new commits trigger CI, the run publishes nothing and ends green with
+`bumped=false` and a notice: the run of the newest commit validates and releases everything
+(GitHub only cancels older *pending* runs). If the only new commits are `[skip ci]` ones (a
+`secrets-rotate` commit), no newer run will come, so the job recomputes on top of them — up to
+five times. When a concurrent release already covered everything, it exits cleanly with no
+release.
 
 ## Inputs
 

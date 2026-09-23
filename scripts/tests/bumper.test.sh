@@ -118,4 +118,23 @@ case "$changelog" in
 esac
 
 
+# ---------------------------------------------------------------------------
+CURRENT_TEST="DEP-12: dependency bumps and reverts release a patch"
+for subject in "chore(deps): bump brace-expansion 2.1.1 to 2.1.7" \
+               "build(deps-dev): bump vitest" \
+               'Revert "feat: something"' \
+               "revert: feat: something"; do
+  d="${WORK_ROOT}/t5-$RANDOM"; mkdir -p "$d"; new_origin "$d"
+  A="$(commit_on_origin "$d" "$subject")"
+  run_bump "$d" "$A"
+  [ "$(output_of "$d" version)" = "1.0.1" ] && pass "${subject} → 1.0.1" || fail "${subject} → bumped=$(output_of "$d" bumped) version=$(output_of "$d" version)"
+done
+
+CURRENT_TEST="DEP-12: a plain chore still releases nothing"
+d="${WORK_ROOT}/t6"; mkdir -p "$d"; new_origin "$d"
+A="$(commit_on_origin "$d" "chore: tidy the README")"
+run_bump "$d" "$A"
+[ "$(output_of "$d" bumped)" = "false" ] && pass "bumped=false" || fail "bumped=$(output_of "$d" bumped)"
+
+
 finish
