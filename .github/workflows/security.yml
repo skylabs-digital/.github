@@ -93,7 +93,8 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          cat > /tmp/osv-gate.cjs <<'GATE'
+          # $RUNNER_TEMP, not /tmp: /tmp is shared by every job on the host.
+          cat > "${RUNNER_TEMP}/osv-gate.cjs" <<'GATE'
           const fs = require('fs');
           const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
           // Gate policy v2: block only on push (deploy about to happen); report on
@@ -106,21 +107,29 @@ jobs:
           const summaryPath = process.env.GITHUB_STEP_SUMMARY;
           const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
 
+          // FAIL-CLOSED in block mode (DEP-18(3)): a scanner that did not
+          // produce a result is not a clean result. On a push to main (the
+          // deploy is next) that is red; on PR/schedule it stays a warning.
+          const noResult = (why) => {
+            const level = MODE === 'block' ? 'error' : 'warning';
+            const msg = `OSV-Scanner produced no usable result (${why}) — ${MODE === 'block' ? 'blocking: nothing was scanned' : 'not blocking in report mode'}.`;
+            console.log(`::${level} title=OSV-Scanner::${msg}`);
+            append(`## OSV-Scanner\n\n${msg}`);
+            process.exit(MODE === 'block' ? 1 : 0);
+          };
+
           if (!fs.existsSync('osv-results.json')) {
             // Scanner produced no file. Distinguish "clean" (exit 0) from a real error.
             if (process.env.OSV_OUTCOME === 'success') {
               append(`## OSV-Scanner\n\nNo vulnerabilities found.`);
-            } else {
-              const msg = 'OSV-Scanner produced no results file (scan may have errored) — not blocking.';
-              console.log(`::warning title=OSV-Scanner::${msg}`);
-              append(`## OSV-Scanner\n\n${msg}`);
+              process.exit(0);
             }
-            process.exit(0);
+            noResult('no results file; the scan step failed');
           }
 
           let data;
           try { data = JSON.parse(fs.readFileSync('osv-results.json', 'utf8')); }
-          catch (e) { console.log(`::warning title=OSV-Scanner::Could not parse results (${e.message}) — not blocking.`); process.exit(0); }
+          catch (e) { noResult(`could not parse the results: ${e.message}`); }
 
           const scoreToRank = (s) => s >= 9 ? 4 : s >= 7 ? 3 : s >= 4 ? 2 : s > 0 ? 1 : 0;
           const rankToLabel = { 4: 'critical', 3: 'high', 2: 'medium', 1: 'low', 0: 'unknown' };
@@ -177,7 +186,7 @@ jobs:
           if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) would block a push to main — not failing this ${process.env.EVENT} run.`); }
           else { console.log(`\nNo blocking findings. ${W.length} warning(s) reported (non-blocking).`); }
           GATE
-          node /tmp/osv-gate.cjs
+          node "${RUNNER_TEMP}/osv-gate.cjs"
 
   secrets-scan:
     name: Gitleaks (secrets in code + history)
@@ -361,6 +370,9 @@ jobs:
       # unfixed CVEs and below-threshold findings are warnings. .grype.yaml
       # ignores are honoured (matched entries move to ignoredMatches).
       - name: Scan image (JSON, non-blocking)
+        id: grype
+        env:
+          IMAGE_REF: ${{ matrix.image.name }}:${{ github.sha }}
         run: |
           set -euo pipefail
           CONFIG_FLAG=""
@@ -368,7 +380,11 @@ jobs:
             echo "Using .grype.yaml from calling repo"
             CONFIG_FLAG="-c .grype.yaml"
           fi
-          grype "${{ matrix.image.name }}:${{ github.sha }}" $CONFIG_FLAG -o json > grype-results.json || true
+          # grype exits 0 when it scanned (findings or not: no --fail-on here)
+          # and non-zero when it could not. The gate decides what that means.
+          rc=0
+          grype "${IMAGE_REF}" $CONFIG_FLAG -o json > grype-results.json || rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
 
       - name: Gate on fixable findings
         env:
@@ -376,9 +392,10 @@ jobs:
           IMAGE: ${{ matrix.image.name }}
           GATE_MODE: ${{ inputs.gate-mode }}
           EVENT: ${{ github.event_name }}
+          GRYPE_RC: ${{ steps.grype.outputs.rc }}
         run: |
           set -euo pipefail
-          cat > /tmp/grype-gate.cjs <<'GATE'
+          cat > "${RUNNER_TEMP}/grype-gate.cjs" <<'GATE'
           const fs = require('fs');
           const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
           const MODE = (process.env.GATE_MODE || 'auto') === 'auto'
@@ -390,9 +407,19 @@ jobs:
           const summaryPath = process.env.GITHUB_STEP_SUMMARY;
           const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
 
+          // FAIL-CLOSED in block mode (DEP-18(3)): a scan that did not run is
+          // not a clean scan. Red on a push to main, a warning otherwise.
+          const noResult = (why) => {
+            const level = MODE === 'block' ? 'error' : 'warning';
+            console.log(`::${level} title=Grype::no usable result for ${IMAGE} (${why}) — ${MODE === 'block' ? 'blocking: nothing was scanned' : 'not blocking in report mode'}.`);
+            append(`## Grype — ${IMAGE}\n\nNo usable result (${why}).`);
+            process.exit(MODE === 'block' ? 1 : 0);
+          };
+          if ((process.env.GRYPE_RC || '0') !== '0') noResult(`grype exited ${process.env.GRYPE_RC}`);
+
           let data;
           try { data = JSON.parse(fs.readFileSync('grype-results.json', 'utf8')); }
-          catch (e) { console.log(`::warning title=Grype::Could not parse results for ${IMAGE} (${e.message}) — not blocking.`); process.exit(0); }
+          catch (e) { noResult(`could not parse the results: ${e.message}`); }
 
           const blocking = [], warnings = [];
           for (const m of data.matches || []) {
@@ -425,7 +452,7 @@ jobs:
           if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) in ${IMAGE} would block a push to main — not failing this ${process.env.EVENT} run.`); }
           else { console.log(`\nNo blocking findings in ${IMAGE}. ${W.length} warning(s) (non-blocking).`); }
           GATE
-          node /tmp/grype-gate.cjs
+          node "${RUNNER_TEMP}/grype-gate.cjs"
 
   # ============================================================
   # WEEKLY ROLLING ISSUE (schedule only) — gate policy v2.
