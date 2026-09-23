@@ -1052,6 +1052,24 @@ jobs:
   # IDACHU_CAC_KEY for a service token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
+  #
+  # API KEYS: NOT VERIFIED IN CI, ON PURPOSE (DEP-07(1) vs CAC-19). Neither
+  # CaC job has SOPS_AGE_KEY or sops, so every key reads as `unreadable` and
+  # the provider leaves the registered one alone: a rotated key committed to
+  # deploy/secrets reaches the droplet (the deploy decrypts it) but NOT idachu,
+  # and nothing turns red. Handing these jobs the age key is NOT the fix: with
+  # sl <= 1.37 a readable sops value is REGISTERED even with
+  # --no-create-keys (cli key-material.ts), so CI would become the one that
+  # rotates, after the deploy, with a 401 window; and in cac-plan any PR could
+  # decrypt the app's secrets. What CI needs before it can verify keys:
+  #   1. a cli mode that compares hashes and never registers (`--keys=verify`
+  #      or `--keys=skip`, CAC-17), failing on a mismatch;
+  #   2. then, in cac-apply ONLY (never cac-plan): the same pinned-sops step
+  #      as `deploy` and `SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}` in the
+  #      apply step's env, with `--no-create-keys --keys=verify`;
+  #   3. `unreadable` in CI becomes an error instead of a note.
+  # Until then both jobs assert that the age key is absent, and
+  # scripts/tests/check_workflows.py fails if a CaC job ever references it.
   # ============================================================
   cac-plan:
     name: CaC plan (${{ inputs.deploy-env }})
@@ -1077,6 +1095,12 @@ jobs:
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
+          # CAC-19: this job must not be able to decrypt deploy/secrets. With
+          # the age key, `sl cac` would register sops values (rotate) from CI.
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error title=CaC::SOPS_AGE_KEY is set in a CaC job: CI would register (rotate) API keys. See the comment on the CaC stage in app-release.yml."
+            exit 1
+          fi
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC plan skipped."
@@ -1234,6 +1258,12 @@ jobs:
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
         run: |
+          # CAC-19: this job must not be able to decrypt deploy/secrets. With
+          # the age key, `sl cac` would register sops values (rotate) from CI.
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error title=CaC::SOPS_AGE_KEY is set in a CaC job: CI would register (rotate) API keys. See the comment on the CaC stage in app-release.yml."
+            exit 1
+          fi
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC apply skipped."

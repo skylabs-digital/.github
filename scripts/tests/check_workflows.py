@@ -307,6 +307,45 @@ def check_untrusted_checkouts_keep_no_token(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+# Where the deploy keys may appear. Anything else reading them is a new place
+# that can decrypt prod or reach a droplet, and must be a decision.
+KEY_HOLDERS = {
+    "SOPS_AGE_KEY": {
+        ("app-release.yml", "deploy"),
+        ("app-release.yml", "secrets-rotate"),
+        ("deploy-manual.yml", "deploy"),
+    },
+    "DEPLOY_SSH_KEY": {
+        ("app-release.yml", "deploy"),
+        ("deploy-manual.yml", "deploy"),
+    },
+}
+# Holders that run without a GitHub Environment, and why.
+NO_ENVIRONMENT_ON_PURPOSE = {
+    # An operator's removal must not wait for a reviewer's approval.
+    ("app-release.yml", "secrets-rotate"),
+}
+
+
+def check_deploy_keys_stay_where_they_are(wfs: dict[str, dict]) -> list[str]:
+    """SOPS_AGE_KEY and DEPLOY_SSH_KEY only in the jobs that deploy or rotate,
+    and those jobs run in the target's GitHub Environment (SEC-01): that is
+    where prod's required reviewers will apply. In particular the CaC jobs
+    never get SOPS_AGE_KEY: with it, `sl cac apply` in CI would register the
+    sops values, i.e. rotate keys (CAC-19)."""
+    errors = []
+    for name, wf in wfs.items():
+        for job_id, job in jobs(wf).items():
+            text = yaml.safe_dump(job)
+            for secret, holders in KEY_HOLDERS.items():
+                if f"secrets.{secret}" in text and (name, job_id) not in holders:
+                    errors.append(f"{name}:{job_id}: reads {secret}, which only {sorted(holders)} may")
+            holds = any(f"secrets.{k}" in text for k in KEY_HOLDERS)
+            if holds and "environment" not in job and (name, job_id) not in NO_ENVIRONMENT_ON_PURPOSE:
+                errors.append(f"{name}:{job_id}: holds a deploy key outside a GitHub Environment")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -321,6 +360,7 @@ CHECKS = [
     check_every_job_declares_permissions,
     check_app_tokens_are_narrow,
     check_untrusted_checkouts_keep_no_token,
+    check_deploy_keys_stay_where_they_are,
 ]
 
 
