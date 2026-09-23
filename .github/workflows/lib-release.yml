@@ -6,7 +6,8 @@ name: Lib Release (reusable)
 # callers only declare `on:` triggers.
 #
 #   STAGE 1  ci         static-checks: typecheck + lint + test (coverage floor)
-#                       + Stryker incremental mutation (parallel required check)
+#   STAGE 1  mutation   Stryker — incremental + informative on PR/push,
+#                       full + blocking on the weekly `schedule` (mutation gate)
 #   STAGE 1  security   org reusable security.yml@main (OSV + Gitleaks; no images)
 #   STAGE 2  release    semantic-release (version + npm publish) — push:main only
 #
@@ -14,9 +15,12 @@ name: Lib Release (reusable)
 # never runs, so PRs get exactly ci + security (REDUCED); main push also
 # publishes (FULL).
 #
-# `run-mutation: true` (default) wires Stryker incremental as a REQUIRED
-# parallel check — closing the ecosystem-wide "Stryker configured locally but
-# absent from CI" gap without each lib hand-rolling a stryker-pr.yml.
+# `run-mutation: true` (default) wires Stryker into CI without each lib
+# hand-rolling a stryker-pr.yml. It is NOT a required status check and it is
+# NOT on the release's critical path: `release` does not wait for it. The gate
+# (Stryker's `thresholds.break` failing the job) is enforced where it costs
+# nobody a merge — the weekly `schedule` full run. See the `mutation` job and
+# the wrapper standard docs/standards/mutation-testing.md (mutation gate).
 #
 # All third-party actions are SHA-pinned here so every consumer inherits the
 # supply-chain hardening for free.
@@ -42,8 +46,7 @@ name: Lib Release (reusable)
 #       with:
 #         node-version: '24'
 #         build-tool: tsup        # tsc | tsup | vite
-#         run-mutation: true      # Stryker incremental as a required check
-#         coverage-floor: 90
+#         run-mutation: true      # Stryker in CI (see the `mutation` job)
 #       secrets: inherit
 #
 # `secrets: inherit` passes GHCR_TOKEN, SEMANTIC_RELEASE_APP_ID/_PRIVATE_KEY.
@@ -66,9 +69,28 @@ on:
         type: string
         default: tsc
       run-mutation:
-        description: 'Run Stryker incremental mutation testing as a required parallel check'
+        description: 'Master switch for Stryker in CI. false = no mutation job on any event (PR, push, schedule).'
         type: boolean
         default: true
+      # ----------------------------------------------------------------
+      # Mutation gate (wrapper bead plato-dx7w, analysis
+      # 2026-09-23-mutation-gate). Both inputs are optional and their defaults
+      # leave every PR and push:main run exactly as informative as before; the
+      # only new behaviour is the weekly `schedule` run, which used to skip
+      # mutation altogether.
+      # ----------------------------------------------------------------
+      mutation-on-change:
+        description: 'Run Stryker incremental on pull_request / push (informative). false = the lib measures mutation only on the weekly schedule (and workflow_dispatch). Ignored when run-mutation is false.'
+        type: boolean
+        default: true
+      mutation-break-blocks:
+        description: 'Where a result below Stryker thresholds.break (or a Stryker run that could not measure at all) FAILS the job: never | schedule | always. `schedule` = the weekly full run (and workflow_dispatch) goes red; PR/push stay informative.'
+        type: string
+        default: schedule
+      mutation-timeout-minutes:
+        description: 'timeout-minutes of the mutation job. A full run of the slowest lib measured 14 min (forms-react, 2026-09-22).'
+        type: number
+        default: 60
       coverage-floor:
         description: 'DEPRECATED (sl-8a5): accepted for caller compatibility only — nothing in this reusable reads it. Enforce coverage in the lib vitest config (coverage-discipline.md). Callers drop it in the weekly sweep; the input is removed once no caller passes it.'
         type: number
@@ -179,18 +201,44 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
   # ============================================================
-  # STAGE 1 — MUTATION (Stryker incremental) — INFORMATIVE PARALLEL CHECK
-  # Closes the ecosystem-wide "Stryker local-only" gap. Runs on every event
-  # (PR + push:main) when run-mutation is true. NON-BLOCKING: a mutation-score
-  # regression is surfaced as a ::warning:: + job summary but the job always
-  # succeeds, so it never blocks a merge or the release. Mutation testing is a
-  # signal to act on, not a gate, for a small team.
+  # STAGE 1 — MUTATION (Stryker) — the mutation gate
+  #
+  # Two modes, chosen by the event (wrapper bead plato-dx7w, analysis
+  # 2026-09-23-mutation-gate, standard docs/standards/mutation-testing.md):
+  #
+  #   pull_request / push   INCREMENTAL, INFORMATIVE. Only when
+  #                         mutation-on-change is true (default). Reuses the
+  #                         cached .stryker-tmp/incremental.json, so a typical
+  #                         run is 1-2 min. A score below `break` is a
+  #                         ::warning:: + job summary — it never fails the job
+  #                         (unless mutation-break-blocks: always).
+  #   schedule / dispatch   FULL, BLOCKING. The weekly cron every lib already
+  #                         declares. Runs `test:mutation:full` if the lib has
+  #                         it, else `test:mutation --force` (Stryker's
+  #                         "ignore the incremental file" flag). A score below
+  #                         `break` — or a Stryker run that could not measure
+  #                         at all — FAILS the job (mutation-break-blocks:
+  #                         schedule, the default). Its incremental file is
+  #                         saved as the freshest main cache, so PR runs reuse
+  #                         a result at most one week old.
+  #
+  # WHY NOT BLOCK ON PR / PUSH. Stryker's `break` is an ABSOLUTE score over the
+  # whole lib, not over the diff: a PR that touches docs could go red for a gap
+  # that predates it. And the full run costs up to ~14 min per lib — the reason
+  # mutation was pulled out of the pipelines on 2026-09-01 (plato-wsfp).
+  #
+  # NOT ON THE RELEASE PATH. `release` does not `needs:` this job any more: a
+  # slow or red mutation run never delays or blocks a publish.
   # ============================================================
   mutation:
-    if: ${{ inputs.run-mutation && github.actor != 'dependabot[bot]' && github.event_name != 'schedule' }}
-    name: Mutation (Stryker incremental)
+    if: >-
+      ${{ inputs.run-mutation && github.actor != 'dependabot[bot]' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || inputs.mutation-on-change) }}
+    name: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Mutation (Stryker full)' || 'Mutation (Stryker incremental)' }}
     runs-on: [self-hosted, linux, x64, skylabs]
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.mutation-timeout-minutes }}
+    env:
+      MUTATION_FULL: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -210,17 +258,20 @@ jobs:
       # survives between runs — the path is gitignored and the checkout is clean,
       # so without this cache every run is a FULL mutation run (sl-0oc; donor
       # pattern: noten/.github/workflows/mutation.yml). Restore falls back to the
-      # branch's latest, then main's. Save runs unconditionally (the Stryker step
-      # is non-blocking, so a below-threshold run must still persist its state).
+      # branch's latest, then main's latest — which, since the weekly full run
+      # saves under the main prefix too, is never older than a week's lineage.
+      # The full run does not restore: it would ignore the file anyway.
       - name: Restore Stryker incremental state
+        if: env.MUTATION_FULL != 'true'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: .stryker-tmp/incremental.json
           key: stryker-incremental-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
+            stryker-incremental-${{ github.ref_name }}-${{ github.sha }}-
             stryker-incremental-${{ github.ref_name }}-
             stryker-incremental-main-
-      - name: Stryker (mutation) — informative, non-blocking
+      - name: Stryker (mutation)
         # Run the repo's canonical mutation script. The standard lib script is
         # `test:mutation`; some repos also alias `mutation`. Prefer test:mutation,
         # fall back to mutation. If neither exists, skip with a warning — do NOT
@@ -229,8 +280,13 @@ jobs:
         # which crashes with "Cannot find module 'stryker-api/config'" and fails
         # the whole job. Incremental mode is the repo's stryker.conf concern.
         #
-        # NON-BLOCKING: we capture Stryker's exit code and always exit 0. A
-        # threshold regression becomes a ::warning:: + job summary, not a failure.
+        # Stryker exits 1 both when the score is under `break` AND when it could
+        # not measure at all (e.g. "There were failed tests in the initial test
+        # run"). The old step reported both as "below threshold"; react-proto-kit
+        # spent weeks with a crash labelled as a low score. The log is parsed so
+        # the summary says which one happened, and prints the absolute score.
+        env:
+          BREAK_BLOCKS: ${{ inputs.mutation-break-blocks }}
         run: |
           # GitHub Actions runs `run:` steps with `bash -e -o pipefail`; `set -uo`
           # does NOT clear the inherited -e, so `yarn test:mutation; rc=$?` used to
@@ -239,29 +295,118 @@ jobs:
           # 32508327098). `set +e` makes the contract real.
           set +e
           set -uo pipefail   # NOT -e: we handle the exit code ourselves
-          if node -e "const s=require('./package.json').scripts||{};process.exit(s['test:mutation']?0:1)"; then
-            yarn test:mutation; rc=$?
-          elif node -e "const s=require('./package.json').scripts||{};process.exit(s.mutation?0:1)"; then
-            yarn mutation; rc=$?
+
+          case "${BREAK_BLOCKS}" in
+            never)    blocking=false ;;
+            schedule) blocking="${MUTATION_FULL}" ;;
+            always)   blocking=true ;;
+            *) echo "::error title=Invalid input::mutation-break-blocks must be never | schedule | always (got '${BREAK_BLOCKS}')"
+               exit 1 ;;
+          esac
+
+          has_script() {
+            node -e "const s=require('./package.json').scripts||{};process.exit(s[process.argv[1]]?0:1)" "$1"
+          }
+          cmd=()
+          if [ "${MUTATION_FULL}" = true ]; then
+            mode=full
+            if has_script test:mutation:full; then cmd=(yarn test:mutation:full)
+            elif has_script test:mutation; then cmd=(yarn test:mutation --force)
+            elif has_script mutation; then cmd=(yarn mutation --force)
+            fi
           else
+            mode=incremental
+            if has_script test:mutation; then cmd=(yarn test:mutation)
+            elif has_script mutation; then cmd=(yarn mutation)
+            fi
+          fi
+
+          if [ "${#cmd[@]}" -eq 0 ]; then
             echo "::warning::No test:mutation or mutation script found — skipping mutation testing"
-            rc=0
-          fi
-          if [ "${rc}" -ne 0 ]; then
-            echo "::warning title=Mutation score below threshold::Stryker exited ${rc}. Informative only — not blocking the merge/release. Review the report above and raise coverage where it matters."
-            { echo "## ⚠️ Mutation (Stryker) — below threshold (informative)";
+            { echo "## ⚠️ Mutation (Stryker) — not measured";
               echo "";
-              echo "Stryker exited \`${rc}\`. This check is **non-blocking**; review the mutants above and add tests where the gap is meaningful."; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## ✅ Mutation (Stryker) — passed" >> "$GITHUB_STEP_SUMMARY"
+              echo "The lib has no \`test:mutation\` / \`mutation\` script."; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          exit 0
+
+          log="${RUNNER_TEMP}/stryker.log"
+          echo "Running (${mode}): ${cmd[*]}"
+          "${cmd[@]}" 2>&1 | tee "${log}"
+          rc=${PIPESTATUS[0]}
+
+          # Strip ANSI colours before parsing Stryker's own lines:
+          #   "Final mutation score of 94.80 is greater than or equal to break threshold 80"
+          #   "Final mutation score 79.31 under breaking threshold 80, setting exit code to 1 (failure)."
+          # and the clear-text reporter's "All files | 94.80 | ..." row as a
+          # fallback for configs without `break`.
+          plain="$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "${log}")"
+          score="$(printf '%s\n' "${plain}" | grep -oE 'Final mutation score (of )?[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
+          if [ -z "${score}" ]; then
+            score="$(printf '%s\n' "${plain}" | grep -E '^[[:space:]]*All files[[:space:]]*\|' | tail -1 | awk -F'|' '{gsub(/[[:space:]]/,"",$2); print $2}')"
+          fi
+          threshold="$(printf '%s\n' "${plain}" | grep -oE 'break(ing)? threshold (of )?[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
+
+          if [ "${rc}" -eq 0 ]; then
+            outcome=passed
+          elif printf '%s\n' "${plain}" | grep -q 'under breaking threshold'; then
+            outcome=below
+          else
+            outcome=crashed
+          fi
+
+          {
+            case "${outcome}" in
+              passed)  echo "## ✅ Mutation (Stryker, ${mode}) — passed" ;;
+              below)   echo "## $([ "${blocking}" = true ] && echo '❌' || echo '⚠️') Mutation (Stryker, ${mode}) — below break threshold" ;;
+              crashed) echo "## $([ "${blocking}" = true ] && echo '❌' || echo '⚠️') Mutation (Stryker, ${mode}) — Stryker failed before producing a score" ;;
+            esac
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Mutation score | **${score:-n/a}** |"
+            echo "| \`thresholds.break\` | ${threshold:-n/a} |"
+            echo "| Mode | ${mode} (\`${cmd[*]}\`) |"
+            echo "| Event | ${GITHUB_EVENT_NAME} |"
+            echo "| Blocking on this event | ${blocking} (mutation-break-blocks: ${BREAK_BLOCKS}) |"
+            echo "| Stryker exit code | ${rc} |"
+            if [ "${mode}" = incremental ]; then
+              echo ""
+              echo "Incremental score: mutants of unchanged files are reused from the cached result, so this is the absolute score of the whole lib, not of the diff. The weekly full run is the authoritative measurement."
+            fi
+            if [ "${outcome}" = crashed ]; then
+              echo ""
+              echo "Stryker exited non-zero without a threshold verdict — typically failing tests in its initial dry run (see the log above). The lib has **no measured score** until this is fixed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "${outcome}" in
+            passed) exit 0 ;;
+            below)
+              if [ "${blocking}" = true ]; then
+                echo "::error title=Mutation score below break::Mutation score ${score:-?} is under thresholds.break ${threshold:-?} (${mode} run). Kill the surviving mutants, or — if the floor was never reachable — pin break to the measured score and ratchet up (mutation-testing.md)."
+                exit 1
+              fi
+              echo "::warning title=Mutation score below break::Mutation score ${score:-?} is under thresholds.break ${threshold:-?}. Informative on ${GITHUB_EVENT_NAME}; the weekly full run enforces it."
+              exit 0 ;;
+            crashed)
+              if [ "${blocking}" = true ]; then
+                echo "::error title=Stryker could not measure::Stryker exited ${rc} without producing a score (${mode} run). See the log — usually failing tests in the initial dry run."
+                exit 1
+              fi
+              echo "::warning title=Stryker could not measure::Stryker exited ${rc} without producing a score. Informative on ${GITHUB_EVENT_NAME}; the weekly full run fails on this."
+              exit 0 ;;
+          esac
+      # Unique key per run: cache keys are immutable, and the weekly full run
+      # usually lands on the same SHA as the last push to main — with a
+      # `<ref>-<sha>` key its fresher result was silently dropped ("cache
+      # already exists"). The restore side matches by prefix and takes the
+      # newest, so the run id suffix costs nothing.
       - name: Save Stryker incremental state
-        if: always()
+        if: always() && hashFiles('.stryker-tmp/incremental.json') != ''
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: .stryker-tmp/incremental.json
-          key: stryker-incremental-${{ github.ref_name }}-${{ github.sha }}
+          key: stryker-incremental-${{ github.ref_name }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ============================================================
   # STAGE 1 — SECURITY (org reusable, @main). No docker-images for libs, so Grype
@@ -284,10 +429,11 @@ jobs:
   # ============================================================
   release:
     name: Semantic release
-    needs: [ci, mutation, security]
-    # `mutation` is informative (always succeeds) and may be skipped
-    # (run-mutation:false); !failure() lets release proceed in both cases while
-    # still blocking on a real ci/security failure.
+    # `mutation` is deliberately NOT in `needs`: it is not a release gate, and
+    # waiting on it delayed publishes by up to ~14 min (the reason several libs
+    # set run-mutation:false on 2026-09-01). The gate lives on the weekly
+    # schedule run instead — see the `mutation` job.
+    needs: [ci, security]
     if: |
       !failure() && !cancelled() &&
       github.event_name == 'push' &&

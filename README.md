@@ -17,7 +17,7 @@ permissions and hands the pipeline to one of these reusables:
 | Workflow | For | Stages |
 |---|---|---|
 | `app-release.yml` | apps | static checks · security · version bump · image build · `sl deploy` · config as code · secret rotation |
-| `lib-release.yml` | libraries | CI · mutation (informative) · security · semantic-release to GitHub Packages |
+| `lib-release.yml` | libraries | CI · mutation (informative on PR/push, blocking on the weekly schedule) · security · semantic-release to GitHub Packages |
 | `security.yml` | everyone (called by the two above) | OSV-Scanner · Gitleaks · Grype · weekly rolling issue |
 | `docs-publish.yml` | every repo with `docs/public/` | announce the section (`sl cac apply`) · publish the pages (`sl docs sync`), with its own pinned `sl` and the job's OIDC token |
 | `deploy-manual.yml` | apps, on demand | the Actions button: typed prod gate · one `sl deploy <env> [servicio] --tag <tag>` · rollback on failure |
