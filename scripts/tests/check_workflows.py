@@ -161,6 +161,42 @@ def check_deploy_manual_deploys_the_tag(wfs: dict[str, dict]) -> list[str]:
     return []
 
 
+def check_rollback_only_when_the_deploy_failed(wfs: dict[str, dict]) -> list[str]:
+    """A rollback recreates every service. It runs when `sl deploy` itself
+    failed or was cancelled, never because a later step (the `<env>-stable`
+    retag, a GHCR hiccup) failed after a good deploy (DEP-05(2)); and a
+    cancelled deploy is rolled back too (DEP-13(2))."""
+    errors = []
+    for name in ("app-release.yml", "deploy-manual.yml"):
+        for job_id, job in jobs(wfs[name]).items():
+            ids = {s.get("id") for s in steps(job) if "sl deploy" in str(s.get("run", ""))
+                   and "rollback" not in str(s.get("run", ""))}
+            ids.discard(None)
+            for s in steps(job):
+                if not str(s.get("name", "")).lower().startswith("rollback"):
+                    continue
+                cond = str(s.get("if", ""))
+                where = f"{name}:{job_id}:{s.get('name')}"
+                if not any(f"steps.{i}.outcome" in cond for i in ids):
+                    errors.append(f"{where}: does not ask whether the sl deploy step itself failed")
+                if "cancelled()" not in cond:
+                    errors.append(f"{where}: a cancelled deploy is not rolled back")
+    return errors
+
+
+def check_stable_retag_cannot_fail_a_deploy(wfs: dict[str, dict]) -> list[str]:
+    """Retagging `<env>-stable` is bookkeeping: it must not turn a good deploy
+    red, nor trigger its rollback (DEP-05(3))."""
+    errors = []
+    for job_id, job in jobs(wfs["app-release.yml"]).items():
+        for s in steps(job):
+            n = str(s.get("name", ""))
+            if (n.startswith("Tag as") or n == "Log in to GHCR") and job_id == "deploy":
+                if s.get("continue-on-error") is not True:
+                    errors.append(f"app-release.yml:{job_id}:{n}: can fail the deploy job")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -168,6 +204,8 @@ CHECKS = [
     check_no_unverified_installs,
     check_sops_is_verified_every_time,
     check_deploy_manual_deploys_the_tag,
+    check_rollback_only_when_the_deploy_failed,
+    check_stable_retag_cannot_fail_a_deploy,
 ]
 
 

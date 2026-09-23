@@ -351,11 +351,13 @@ jobs:
       # necesita SOPS_AGE_KEY — `rollback` no descifra nada, le pide al droplet
       # que vuelva al último tag promovido.
       #
-      # `steps.deploy.outcome != 'skipped'`: si lo que falló fue el checkout, el
-      # install o sops, no se desplegó nada y un rollback DEGRADARÍA un servicio
-      # sano. Sólo se revierte si el deploy llegó a correr.
+      # Sólo si el paso `sl deploy` MISMO falló o se canceló: si lo que falló
+      # fue el checkout, el install o sops, no se desplegó nada y un rollback
+      # DEGRADARÍA un servicio sano. `cancelled()`: un timeout o una
+      # cancelación a mano a mitad del deploy también revierten (DEP-13(2));
+      # `failure()` solo no es verdadero en una cancelación.
       - name: Rollback on failure
-        if: ${{ failure() && inputs.rollback-on-failure && steps.deploy.outcome != 'skipped' }}
+        if: ${{ (failure() || cancelled()) && inputs.rollback-on-failure && (steps.deploy.outcome == 'failure' || steps.deploy.outcome == 'cancelled') }}
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json

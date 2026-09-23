@@ -735,6 +735,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
       - name: sl deploy ${{ inputs.deploy-env }} --tag v${{ needs.version.outputs.version }}
+        id: sl-deploy
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
@@ -747,8 +748,19 @@ jobs:
           CI: 'true'
         run: yarn sl deploy "${{ inputs.deploy-env }}" --tag "v${{ needs.version.outputs.version }}"
 
+      # The `<env>-stable` retag is bookkeeping on the registry, not part of
+      # the deploy: a `docker pull` of 400 MB that gets cut, or GHCR having a
+      # bad minute, used to turn a GOOD deploy red, fire the rollback (which
+      # recreates every service) and skip cac-apply and the retention
+      # (DEP-05(3)). Now it only warns. Rejected: `docker buildx imagetools
+      # create -t`, the registry-side retag the analysis suggests. Measured
+      # (buildx 0.33, --dry-run on a single-platform manifest): it wraps the
+      # image in a NEW index, so `<env>-stable` would get another digest and a
+      # manifest list, which breaks resuelto's size guard and the retention's
+      # "one version per image" reading.
       - name: Log in to GHCR
         if: success()
+        continue-on-error: true
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
         with:
           registry: ghcr.io
@@ -760,6 +772,7 @@ jobs:
         # el REGISTRO de imágenes, no sobre un droplet, y el CLI no hace
         # operaciones de registro en esta etapa (regla de entrada del estándar).
         if: success()
+        continue-on-error: true
         env:
           SERVICES: ${{ needs.matrix.outputs.services }}
           TAG: v${{ needs.version.outputs.version }}
@@ -775,8 +788,18 @@ jobs:
 
       # El `Rollback on failure` NO necesita `SOPS_AGE_KEY`: `rollback` no
       # descifra nada, sólo le pide al script que vuelva al último tag promovido.
+      #
+      # Cuándo: sólo si el paso `sl deploy` MISMO falló o se canceló.
+      #   - `failure()` a secas revertía también un deploy bueno cuando fallaba
+      #     algo después (el retag de `<env>-stable`), con downtime y sin
+      #     mover nada más (DEP-05(2)). `deploy-manual.yml` ya preguntaba por
+      #     el outcome del paso.
+      #   - `cancelled()`: un timeout del job o una cancelación a mano dejaban
+      #     el droplet a mitad de camino y SIN rollback, porque `failure()` no
+      #     es verdadero en una cancelación (DEP-13(2)). Actions le da a este
+      #     paso unos minutos después de la cancelación.
       - name: Rollback on failure
-        if: failure()
+        if: (failure() || cancelled()) && (steps.sl-deploy.outcome == 'failure' || steps.sl-deploy.outcome == 'cancelled')
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
