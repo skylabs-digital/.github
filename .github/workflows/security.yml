@@ -3,8 +3,10 @@ name: Security Scan (reusable)
 # Reusable security workflow for Skylabs Digital repos.
 # See README.md for usage and templates.
 #
-# Note: no `permissions:` block — permissions are inherited from the caller.
-# Callers typically set `permissions: contents: read` at workflow level.
+# Permissions: the scan jobs cap themselves at `contents: read` (DEP-15), a
+# subset of what every caller grants. `weekly-security-report` inherits the
+# caller's on purpose: it needs `issues: write` where the caller grants it, and
+# asking for it here would fail the whole run at startup where it does not.
 
 on:
   workflow_call:
@@ -51,12 +53,17 @@ jobs:
     if: ${{ !inputs.gitleaks-only }}
     name: OSV-Scanner (deps)
     runs-on: [self-hosted, linux, x64, skylabs]
+    # Reads the checkout; the scanners need nothing else.
+    permissions:
+      contents: read
     timeout-minutes: 20
     outputs:
       summary_b64: ${{ steps.gate.outputs.summary_b64 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
 
       # OSV-Scanner has no native "--only-fixed" (unlike Grype), so run it
       # non-blocking with JSON output and let the gate step below decide.
@@ -86,7 +93,8 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          cat > /tmp/osv-gate.cjs <<'GATE'
+          # $RUNNER_TEMP, not /tmp: /tmp is shared by every job on the host.
+          cat > "${RUNNER_TEMP}/osv-gate.cjs" <<'GATE'
           const fs = require('fs');
           const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
           // Gate policy v2: block only on push (deploy about to happen); report on
@@ -99,21 +107,29 @@ jobs:
           const summaryPath = process.env.GITHUB_STEP_SUMMARY;
           const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
 
+          // FAIL-CLOSED in block mode (DEP-18(3)): a scanner that did not
+          // produce a result is not a clean result. On a push to main (the
+          // deploy is next) that is red; on PR/schedule it stays a warning.
+          const noResult = (why) => {
+            const level = MODE === 'block' ? 'error' : 'warning';
+            const msg = `OSV-Scanner produced no usable result (${why}) — ${MODE === 'block' ? 'blocking: nothing was scanned' : 'not blocking in report mode'}.`;
+            console.log(`::${level} title=OSV-Scanner::${msg}`);
+            append(`## OSV-Scanner\n\n${msg}`);
+            process.exit(MODE === 'block' ? 1 : 0);
+          };
+
           if (!fs.existsSync('osv-results.json')) {
             // Scanner produced no file. Distinguish "clean" (exit 0) from a real error.
             if (process.env.OSV_OUTCOME === 'success') {
               append(`## OSV-Scanner\n\nNo vulnerabilities found.`);
-            } else {
-              const msg = 'OSV-Scanner produced no results file (scan may have errored) — not blocking.';
-              console.log(`::warning title=OSV-Scanner::${msg}`);
-              append(`## OSV-Scanner\n\n${msg}`);
+              process.exit(0);
             }
-            process.exit(0);
+            noResult('no results file; the scan step failed');
           }
 
           let data;
           try { data = JSON.parse(fs.readFileSync('osv-results.json', 'utf8')); }
-          catch (e) { console.log(`::warning title=OSV-Scanner::Could not parse results (${e.message}) — not blocking.`); process.exit(0); }
+          catch (e) { noResult(`could not parse the results: ${e.message}`); }
 
           const scoreToRank = (s) => s >= 9 ? 4 : s >= 7 ? 3 : s >= 4 ? 2 : s > 0 ? 1 : 0;
           const rankToLabel = { 4: 'critical', 3: 'high', 2: 'medium', 1: 'low', 0: 'unknown' };
@@ -170,16 +186,20 @@ jobs:
           if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) would block a push to main — not failing this ${process.env.EVENT} run.`); }
           else { console.log(`\nNo blocking findings. ${W.length} warning(s) reported (non-blocking).`); }
           GATE
-          node /tmp/osv-gate.cjs
+          node "${RUNNER_TEMP}/osv-gate.cjs"
 
   secrets-scan:
     name: Gitleaks (secrets in code + history)
     runs-on: [self-hosted, linux, x64, skylabs]
+    # Reads the checkout; the scanners need nothing else.
+    permissions:
+      contents: read
     timeout-minutes: 20
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install Gitleaks v8.30.1
@@ -200,11 +220,17 @@ jobs:
               exit 1
               ;;
           esac
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}" -o gitleaks.tgz
-          echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
-          tar -xzf gitleaks.tgz gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
-          gitleaks version
+          # Into this job's $RUNNER_TEMP, not /usr/local/bin with sudo: the
+          # runners are persistent hosts (DEP-02), and a binary in a shared
+          # path outlives the job and gets reused by the next one unverified.
+          BIN_DIR="${RUNNER_TEMP}/gitleaks-${VERSION}"
+          mkdir -p "${BIN_DIR}"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}" -o "${BIN_DIR}/gitleaks.tgz"
+          echo "${SHA256}  ${BIN_DIR}/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "${BIN_DIR}/gitleaks.tgz" -C "${BIN_DIR}" gitleaks
+          rm -f "${BIN_DIR}/gitleaks.tgz"
+          echo "${BIN_DIR}" >> "$GITHUB_PATH"
+          "${BIN_DIR}/gitleaks" version
 
       # Full-history secret scan. A leaked secret stays leaked, so we keep
       # exit-code 1 on real findings — but allow callers to suppress confirmed
@@ -216,7 +242,15 @@ jobs:
           set -euo pipefail
           CONFIG_FLAG=""
           if [ -f .gitleaks.toml ]; then
-            echo "Using .gitleaks.toml allowlist from calling repo"
+            # A config WITHOUT `[extend] useDefault = true` replaces the
+            # default rules instead of extending them: an allowlist-only file
+            # means zero rules, and a check that is green forever (resuelto:
+            # 0 findings with its config, 42 with the defaults — SEC-21).
+            if ! grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' .gitleaks.toml; then
+              echo "::error title=Gitleaks config::.gitleaks.toml does not extend the default rules. Add:%0A[extend]%0AuseDefault = true%0Aat the top, or this scan checks nothing (SEC-21)."
+              exit 1
+            fi
+            echo "Using .gitleaks.toml (extends the default rules) from calling repo"
             CONFIG_FLAG="-c .gitleaks.toml"
           fi
           gitleaks detect --source . $CONFIG_FLAG --redact --exit-code 1 --verbose
@@ -227,6 +261,9 @@ jobs:
     if: ${{ inputs.docker-images != '[]' && github.event_name != 'pull_request' }}
     name: Grype (${{ matrix.image.name }})
     runs-on: [self-hosted, linux, x64, skylabs]
+    # Reads the checkout; the scanners need nothing else.
+    permissions:
+      contents: read
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -284,7 +321,9 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
@@ -302,17 +341,46 @@ jobs:
           secrets: |
             npm_token=${{ steps.npm.outputs.token }}
 
+      # The release tarball with a pinned checksum, into $RUNNER_TEMP. It used
+      # to be `curl …/install.sh | sh -s -- -b /usr/local/bin`: a script run
+      # unverified, writing into a path every later job on this persistent
+      # host trusts (DEP-16(4)). Checksums from grype_0.111.1_checksums.txt of
+      # the GitHub release, and re-hashed from the downloaded tarball.
       - name: Install Grype v0.111.1
         run: |
           set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.111.1/install.sh | sh -s -- -b /usr/local/bin v0.111.1
-          grype version
+          VERSION=0.111.1
+          case "$(uname -m)" in
+            x86_64)
+              ASSET=grype_${VERSION}_linux_amd64.tar.gz
+              SHA256=2bc0bc60f1f4e10b0429f5e84517ec4cf0d769d2ef66875c64fc6640e136fd8f
+              ;;
+            aarch64|arm64)
+              ASSET=grype_${VERSION}_linux_arm64.tar.gz
+              SHA256=ba126117fbe14ad9797a3080812f4398742dfad91208c87ce8d44717f6e1fbc5
+              ;;
+            *)
+              echo "Unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="${RUNNER_TEMP}/grype-${VERSION}"
+          mkdir -p "${BIN_DIR}"
+          curl -sSfL "https://github.com/anchore/grype/releases/download/v${VERSION}/${ASSET}" -o "${BIN_DIR}/grype.tgz"
+          echo "${SHA256}  ${BIN_DIR}/grype.tgz" | sha256sum -c -
+          tar -xzf "${BIN_DIR}/grype.tgz" -C "${BIN_DIR}" grype
+          rm -f "${BIN_DIR}/grype.tgz"
+          echo "${BIN_DIR}" >> "$GITHUB_PATH"
+          "${BIN_DIR}/grype" version
 
       # Scan to JSON (non-blocking), then apply the same fixability policy as
       # the OSV gate: BLOCK only on FIXABLE findings >= grype-fail-on-severity;
       # unfixed CVEs and below-threshold findings are warnings. .grype.yaml
       # ignores are honoured (matched entries move to ignoredMatches).
       - name: Scan image (JSON, non-blocking)
+        id: grype
+        env:
+          IMAGE_REF: ${{ matrix.image.name }}:${{ github.sha }}
         run: |
           set -euo pipefail
           CONFIG_FLAG=""
@@ -320,7 +388,11 @@ jobs:
             echo "Using .grype.yaml from calling repo"
             CONFIG_FLAG="-c .grype.yaml"
           fi
-          grype "${{ matrix.image.name }}:${{ github.sha }}" $CONFIG_FLAG -o json > grype-results.json || true
+          # grype exits 0 when it scanned (findings or not: no --fail-on here)
+          # and non-zero when it could not. The gate decides what that means.
+          rc=0
+          grype "${IMAGE_REF}" $CONFIG_FLAG -o json > grype-results.json || rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
 
       - name: Gate on fixable findings
         env:
@@ -328,9 +400,10 @@ jobs:
           IMAGE: ${{ matrix.image.name }}
           GATE_MODE: ${{ inputs.gate-mode }}
           EVENT: ${{ github.event_name }}
+          GRYPE_RC: ${{ steps.grype.outputs.rc }}
         run: |
           set -euo pipefail
-          cat > /tmp/grype-gate.cjs <<'GATE'
+          cat > "${RUNNER_TEMP}/grype-gate.cjs" <<'GATE'
           const fs = require('fs');
           const FAIL_ON = (process.env.FAIL_ON || 'critical').toLowerCase();
           const MODE = (process.env.GATE_MODE || 'auto') === 'auto'
@@ -342,9 +415,19 @@ jobs:
           const summaryPath = process.env.GITHUB_STEP_SUMMARY;
           const append = (s) => { if (summaryPath) fs.appendFileSync(summaryPath, s + '\n'); console.log(s); };
 
+          // FAIL-CLOSED in block mode (DEP-18(3)): a scan that did not run is
+          // not a clean scan. Red on a push to main, a warning otherwise.
+          const noResult = (why) => {
+            const level = MODE === 'block' ? 'error' : 'warning';
+            console.log(`::${level} title=Grype::no usable result for ${IMAGE} (${why}) — ${MODE === 'block' ? 'blocking: nothing was scanned' : 'not blocking in report mode'}.`);
+            append(`## Grype — ${IMAGE}\n\nNo usable result (${why}).`);
+            process.exit(MODE === 'block' ? 1 : 0);
+          };
+          if ((process.env.GRYPE_RC || '0') !== '0') noResult(`grype exited ${process.env.GRYPE_RC}`);
+
           let data;
           try { data = JSON.parse(fs.readFileSync('grype-results.json', 'utf8')); }
-          catch (e) { console.log(`::warning title=Grype::Could not parse results for ${IMAGE} (${e.message}) — not blocking.`); process.exit(0); }
+          catch (e) { noResult(`could not parse the results: ${e.message}`); }
 
           const blocking = [], warnings = [];
           for (const m of data.matches || []) {
@@ -377,7 +460,7 @@ jobs:
           if (B.length) { console.log(`\nreport mode: ${B.length} finding(s) in ${IMAGE} would block a push to main — not failing this ${process.env.EVENT} run.`); }
           else { console.log(`\nNo blocking findings in ${IMAGE}. ${W.length} warning(s) (non-blocking).`); }
           GATE
-          node /tmp/grype-gate.cjs
+          node "${RUNNER_TEMP}/grype-gate.cjs"
 
   # ============================================================
   # WEEKLY ROLLING ISSUE (schedule only) — gate policy v2.

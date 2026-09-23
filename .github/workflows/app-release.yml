@@ -74,7 +74,8 @@ name: App Release (reusable)
 # Every image built is built with two build-args, guaranteed:
 #
 #   APP_VERSION=vX.Y.Z      the version the `version` job just computed and tagged
-#   BUILD_COMMIT=<sha>      the exact main commit being built
+#   BUILD_COMMIT=<sha>      the exact commit being built: the one tag vX.Y.Z
+#                           points at (the release commit), not github.sha
 #
 # A Dockerfile that wants them declares `ARG APP_VERSION` / `ARG BUILD_COMMIT`
 # and fixes them as `ENV`; one that does not declare them silently ignores them
@@ -123,6 +124,14 @@ on:
           comportamiento.
         type: boolean
         default: true
+      sl-min-version:
+        description: >
+          The oldest `@skylabs-digital/cli` the repo may pin for the jobs that
+          run `sl` against an environment (deploy, CaC). Default: the fleet's
+          floor on 2026-09-23, so no app changes. Raise it to force a pin wave
+          (DEP-08(3)).
+        type: string
+        default: '1.22.0'
     outputs:
       version:
         description: >
@@ -137,6 +146,14 @@ on:
     secrets:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages + write:packages) for private npm installs and the GHCR docker login. NOT for cloning repositories: read:packages cannot check out a private repo, so the registry checkout uses a GitHub App token instead.'
+        required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
         required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'GitHub App id for semantic-release-bot-skylabs (mints git-push token)'
@@ -193,6 +210,9 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'repository_dispatch'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (`yarn install`): read-only, whatever the caller granted (DEP-15).
+    permissions:
+      contents: read
     # Todos los jobs de este archivo corren en la pool self-hosted, que son
     # NUEVE runners para toda la flota: uno colgado no se recicla solo como una
     # VM de GitHub, se queda con su lugar hasta que alguien lo mate a mano. Las
@@ -205,6 +225,8 @@ jobs:
       services: ${{ steps.sl.outputs.services }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
@@ -213,7 +235,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: yarn sl app services
         id: sl
         run: |
@@ -252,9 +274,14 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
     name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (`yarn ci`): read-only, whatever the caller granted (DEP-15).
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
@@ -263,7 +290,7 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - name: CI (typecheck + lint + test + build)
         run: yarn ci
 
@@ -305,7 +332,7 @@ jobs:
       # npm-token, but that App token lacks read:packages → 403 Forbidden on the
       # private-package install (whole Grype matrix fails). The App token is only
       # needed by the version stage (commit/tag push), which mints its own.
-      npm-token: ${{ secrets.GHCR_TOKEN }}
+      npm-token: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
   # ============================================================
   # STAGE 2 — VERSION BUMP  (THE FORK POINT)
@@ -319,8 +346,11 @@ jobs:
     if: |
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      !contains(github.event.head_commit.message, 'chore(release):')
+      !startsWith(github.event.head_commit.message, 'chore(release): v')
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Commits, tags and releases with the App token, not GITHUB_TOKEN.
+    permissions:
+      contents: read
     timeout-minutes: 10
     outputs:
       version: ${{ steps.bump.outputs.version }}
@@ -332,6 +362,7 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: write
           # SIN `owner:` a propósito. Con `owner` el token sale con acceso a
           # TODOS los repos donde la App está instalada (los 41); sin él, la
           # action lo acota al repo actual, que es lo único que este job toca:
@@ -387,6 +418,13 @@ jobs:
               BUMP=minor
             elif printf '%s\n' "$SUBJECTS" | grep -qiE '^(fix|perf|refactor)(\([^)]+\))?:'; then
               BUMP=patch
+            # Dependency bumps and reverts change what runs, so they ship too
+            # (DEP-12): a security bump that lands as `chore(deps)` used to
+            # leave QA on the vulnerable version, with every check green, until
+            # the next feat/fix. `(deps…)` is Dependabot's scope (`deps`,
+            # `deps-dev`); `Revert "…"` is what GitHub's revert button writes.
+            elif printf '%s\n' "$SUBJECTS" | grep -qiE '^((chore|build)\(deps(-dev)?\)|revert(\([^)]+\))?):|^revert "'; then
+              BUMP=patch
             else
               return 1
             fi
@@ -423,12 +461,15 @@ jobs:
             else
               RANGE_COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline --pretty=format:"- %s (%h)")
             fi
-            ENTRY="## [${NEW}] - ${DATE}\n\n${RANGE_COMMITS}\n"
-            if [ -f CHANGELOG.md ]; then
-              echo -e "# Changelog\n\n${ENTRY}\n$(tail -n +2 CHANGELOG.md)" > CHANGELOG.md
-            else
-              echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
-            fi
+            # `printf '%s'`, never `echo -e`: the subjects are user text, and
+            # `echo -e` interprets them — a `\c` in a subject (`C:\config`)
+            # stopped the output right there and the bumper committed a
+            # CHANGELOG cut at that byte, history included (DEP-20).
+            {
+              printf '# Changelog\n\n## [%s] - %s\n\n%s\n\n' "$NEW" "$DATE" "$RANGE_COMMITS"
+              if [ -f CHANGELOG.md ]; then tail -n +2 CHANGELOG.md; fi
+            } > CHANGELOG.md.new
+            mv CHANGELOG.md.new CHANGELOG.md
 
             git add -A
             git commit -m "chore(release): v${NEW} [skip ci]"
@@ -457,10 +498,51 @@ jobs:
             echo "version=" >> $GITHUB_OUTPUT
           }
 
+          # EL RUN SOLO PUBLICA LO QUE VALIDO (DEP-03, pre-mortem de despliegue
+          # 2026-09-23). `static-checks`, Gitleaks y OSV corrieron sobre
+          # GITHUB_SHA. Si `main` ya esta mas alla de GITHUB_SHA, recalcular
+          # sobre `origin/main` publicaba commits que ningun run valido en main:
+          # idachu run 35804850323 salio como v5.26.0 con bb1e3c0 y 31e1704
+          # adentro, que solo pasaron por su PR sobre otra base.
+          #
+          # Asi que, si main se movio:
+          #   - con al menos un commit que dispara CI: este run NO publica. Sale
+          #     verde con bumped=false. El run del commit mas nuevo publica todo:
+          #     GitHub solo cancela los runs *pending* viejos, nunca el mas nuevo,
+          #     y su static-checks cubre ese HEAD.
+          #   - solo con commits `[skip ci]` (una rotacion de recipients de
+          #     `secrets-rotate`, un release de otro run): NO va a haber un run
+          #     mas nuevo que publique, asi que se recalcula sobre origin/main
+          #     como antes. Esos commits se eximieron de CI a proposito.
+          main_moved_only_by_skip_ci() {
+            local from="$1" to="$2" sha msg
+            for sha in $(git rev-list "${from}..${to}"); do
+              msg="$(git log -1 --format=%B "$sha")"
+              if ! printf '%s' "$msg" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then
+                return 1
+              fi
+            done
+            return 0
+          }
+
+          superseded() {
+            local remote="$1"
+            echo "::notice title=Release superseded::main advanced past ${GITHUB_SHA} (now ${remote}) with commits this run did not validate. Nothing published here: the run of the newer commit releases everything."
+            {
+              echo "### Sin release: lo publica un run más nuevo"
+              echo ""
+              echo "main avanzó de \`${GITHUB_SHA}\` a \`${remote}\` mientras este run esperaba o corría,"
+              echo "con commits que este run no validó (DEP-03). The newer run releases them."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          }
+
           # Push el commit de release y su tag ATOMICAMENTE. Si lo rechazan
           # porque `main` se movio, NO se reintenta rebasando el MISMO commit:
-          # se descarta, se refresca `origin/main`, y se RECALCULA la version
-          # entera desde cero contra la base real.
+          # se descarta, se refresca `origin/main`, y se decide segun lo de
+          # arriba. Si `main` no se movio (el rechazo fue por un tag que otro
+          # run publico), se RECALCULA la version entera desde cero.
           #
           # Por que. Dos releases que arrancan casi juntos parten del mismo
           # `CURRENT` y terminan tocando las MISMAS lineas de version en
@@ -478,18 +560,35 @@ jobs:
           # evita nombres de tag repetidos: no se entera de que el archivo
           # que esta por commitear ya lo toco el release concurrente.
           #
-          # Recalcular desde `origin/main` fresco convierte el caso comun (el
-          # concurrente ya libero todo esto) en un no-op limpio —
-          # `compute_release` devuelve 1 porque el rango `LAST_TAG..HEAD` ya
-          # no tiene nada liberable — y el caso raro (el concurrente liberaba
-          # ALGO pero no todo) en un bump correcto sobre la base real, en vez
-          # de un commit corrupto o un conflicto que bloquea el pipeline.
+          # Recalcular (sobre GITHUB_SHA, o sobre un main que solo avanzo con
+          # `[skip ci]`) convierte el caso comun (el concurrente ya libero todo
+          # esto) en un no-op limpio — `compute_release` devuelve 1 porque el
+          # rango `LAST_TAG..HEAD` ya no tiene nada liberable — y el caso raro
+          # (el concurrente liberaba ALGO pero no todo) en un bump correcto
+          # sobre la base real, en vez de un commit corrupto o un conflicto que
+          # bloquea el pipeline. Un main que avanzo con codigo nuevo no se
+          # recalcula: lo publica su propio run (DEP-03, arriba).
           PUSHED=false
+          BASE="${GITHUB_SHA}"
           for attempt in 1 2 3 4 5; do
-            if [ "$attempt" -gt 1 ]; then
-              echo "Intento ${attempt}: descartando el commit de release anterior y recalculando contra origin/main"
-              git fetch --quiet origin main
-              git reset --hard origin/main
+            git fetch --quiet origin main
+            REMOTE="$(git rev-parse FETCH_HEAD)"
+            if [ "$REMOTE" != "$BASE" ]; then
+              if ! git merge-base --is-ancestor "$BASE" "$REMOTE"; then
+                echo "::error::origin/main (${REMOTE}) no desciende de ${BASE}: alguien reescribio main. No se publica nada."
+                exit 1
+              fi
+              if main_moved_only_by_skip_ci "$BASE" "$REMOTE"; then
+                echo "main avanzo solo con commits [skip ci] (${BASE}..${REMOTE}): se recalcula sobre ${REMOTE}"
+                BASE="$REMOTE"
+              else
+                superseded "$REMOTE"
+                exit 0
+              fi
+            fi
+            if [ "$attempt" -gt 1 ] || [ "$(git rev-parse HEAD)" != "$BASE" ]; then
+              echo "Intento ${attempt}: descartando el commit de release anterior y recalculando sobre ${BASE}"
+              git reset --hard --quiet "$BASE"
               # El tag LOCAL del intento anterior sobrevive al reset (`reset
               # --hard` solo mueve la rama y el working tree) y confundiria al
               # guard de colision de `compute_release`, que lo veria como si
@@ -499,7 +598,7 @@ jobs:
 
             if ! compute_release; then
               if [ "$attempt" -eq 1 ]; then
-                no_releasable_commits "Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor, y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
+                no_releasable_commits "Push a main sin commits liberables: NO se construyo ni desplego nada. Liberan: feat / fix / perf / refactor / revert, chore(deps) y build(deps), y cualquier type con '!' o con footer 'BREAKING CHANGE:'."
               else
                 no_releasable_commits "Un release concurrente ya cubrio todo lo que este intento iba a liberar: NO se construyo ni desplego nada de mas."
               fi
@@ -534,14 +633,26 @@ jobs:
   # ============================================================
   # STAGE 3 — BUILD IMAGES
   # One matrix entry per service, sourced from the descriptor (job `matrix`).
-  # Pushes vN + sha + latest to GHCR. Unreachable on PR (needs version, which
-  # never runs there).
+  # Pushes vN + sha to GHCR. Unreachable on PR (needs version, which never
+  # runs there).
+  #
+  # `:latest` is NOT pushed here when this pipeline deploys (DEP-17(1)): it
+  # used to point at the newest BUILD before anyone knew whether its deploy
+  # worked, and every `${X_TAG:-latest}` in a compose file (a fresh droplet,
+  # a lost `<SVC>_TAG`) then started an image nobody had validated. It moves
+  # together with `<env>-stable`, after a successful deploy. With
+  # `deploy: false` there is no deploy to wait for, so it is pushed here as
+  # before.
   # ============================================================
   build-images:
     name: Build image (${{ matrix.service.name }})
     needs: [version, matrix]
     if: needs.version.outputs.bumped == 'true'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Pushes the images to GHCR with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -551,6 +662,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: v${{ needs.version.outputs.version }}
+      # The commit the image is built FROM: the one the tag points at (the
+      # release commit on top of what `version` validated), not
+      # `github.sha`. They differed whenever `version` recalculated on a
+      # newer main (DEP-03(2)): the image said BUILD_COMMIT=A while its
+      # content was C + bump.
+      - name: Commit of the tag
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
       - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
         with:
@@ -564,13 +683,13 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:v${{ needs.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ steps.commit.outputs.sha }}
+            ${{ !inputs.deploy && format('ghcr.io/{0}/{1}:latest', github.repository_owner, matrix.service.name) || '' }}
           build-args: |
-            BUILD_COMMIT=${{ github.sha }}
+            BUILD_COMMIT=${{ steps.commit.outputs.sha }}
             APP_VERSION=v${{ needs.version.outputs.version }}
           secrets: |
-            npm_token=${{ secrets.GHCR_TOKEN }}
+            npm_token=${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
           provenance: false
@@ -589,8 +708,24 @@ jobs:
     needs: [version, build-images, matrix]
     if: needs.version.outputs.bumped == 'true' && inputs.deploy
     runs-on: ${{ fromJson(inputs.runner-labels) }}
-    timeout-minutes: 30
+    # Retags `<env>-stable`/`latest` in GHCR with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
+    # 45 and not 30: a failed deploy (up to ~15 min measured) can now be
+    # followed by a full redeploy of the last-good release (DEP-04), and a
+    # timeout in the middle of that rollback is the worst place to stop.
+    timeout-minutes: 45
     environment: ${{ inputs.deploy-env }}
+    # One deploy at a time per (app, env), shared with deploy-manual.yml
+    # (DEP-14(3)). The droplet-side `flock` lasts ONE command, not the whole
+    # deploy: a manual deploy could swap its fragment+env between this
+    # deploy's swap and its `up`. Never cancelled mid-flight. GitHub keeps one
+    # PENDING job per group: a third deploy queued behind two replaces the
+    # waiting one (it shows as cancelled, and it never started).
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.deploy-env }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -609,15 +744,19 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -625,33 +764,27 @@ jobs:
 
       - name: Install sops (pinned + checksum)
         # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
-        # El checksum se verifica SIEMPRE y justo antes de usar el binario,
-        # esté recién bajado o cacheado. Antes el `sha256sum -c` vivía DENTRO
-        # del `if [ ! -x … ]`: como $HOME sobrevive entre jobs en los runners
-        # self-hosted, un sops plantado por cualquier otro job del pool se
-        # reusaba para siempre — y este paso lo deja en el PATH de un job que
-        # corre con SOPS_AGE_KEY en el entorno, o sea el binario que descifra
-        # prod. Si no coincide, se borra y se vuelve a bajar; si la descarga
-        # tampoco coincide, el job corta con ::error::. No devolver la
-        # verificación adentro del `if`. Bead sl-zldd.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         run: |
           set -euo pipefail
           SOPS_VER=v3.11.0
           SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
-          SOPS_BIN="$HOME/.local/bin/sops-$SOPS_VER"
-          SOPS_TMP="${RUNNER_TEMP:-/tmp}/sops-$SOPS_VER.$$"
-          mkdir -p "$HOME/.local/bin"
-          sops_ok() { [ -f "$1" ] && echo "$SOPS_SHA  $1" | sha256sum -c - >/dev/null 2>&1; }
-          if ! sops_ok "$SOPS_BIN"; then
-            rm -f "$SOPS_BIN"
-            curl -sSL -o "$SOPS_TMP" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
-            sops_ok "$SOPS_TMP" || { echo "::error::el sops $SOPS_VER recien descargado NO coincide con el checksum fijado"; rm -f "$SOPS_TMP"; exit 1; }
-            install -m 0755 "$SOPS_TMP" "$SOPS_BIN"
-            rm -f "$SOPS_TMP"
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          sops_ok "$SOPS_BIN" || { echo "::error::el sops $SOPS_VER de $SOPS_BIN NO coincide con el checksum fijado"; exit 1; }
-          ln -sf "$SOPS_BIN" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -661,9 +794,115 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
+      # SSH HOST KEYS PINNED, NOT TOFU (DEP-10). `sl` connects with
+      # `StrictHostKeyChecking=accept-new` against the runner's persistent
+      # ~/.ssh/known_hosts: the first contact accepts ANY key (a MITM there is
+      # silent) and, after the QA reset recreates a droplet on the same IP,
+      # the old key makes every deploy die with "Host key verification failed"
+      # until someone cleans nine hosts by hand.
+      #
+      # This step puts an `ssh` in front of the real one, for this job only,
+      # that forces `StrictHostKeyChecking=yes` against a known_hosts written
+      # to $RUNNER_TEMP. ssh keeps the FIRST value of each option, so ours win
+      # over `sl`'s `accept-new`; and `sl`'s ProxyCommand (the bastion hop)
+      # runs `ssh` through PATH too, so both hops are pinned. Sources, in order:
+      #   1. registry/known_hosts in infra (the sparse checkout above): what
+      #      infra would publish on every apply, so it survives recreation;
+      #   2. the DEPLOY_KNOWN_HOSTS variable (org, repo or environment);
+      #   3. neither: today's behaviour, with a warning.
+      # The format is plain known_hosts: `10.10.10.2 ssh-ed25519 AAAA…` for a
+      # droplet, `[bastion.host]:2222 ssh-ed25519 AAAA…` for the bastion.
+      - name: Pin SSH host keys
+        env:
+          KNOWN_HOSTS_VAR: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          REGISTRY_KNOWN_HOSTS: ${{ github.workspace }}/.infra-registry/registry/known_hosts
+        run: |
+          set -euo pipefail
+          if [ -s "${REGISTRY_KNOWN_HOSTS}" ]; then
+            src="registry/known_hosts (infra)"
+            content="$(cat "${REGISTRY_KNOWN_HOSTS}")"
+          elif [ -n "${KNOWN_HOSTS_VAR}" ]; then
+            src="the DEPLOY_KNOWN_HOSTS variable"
+            content="${KNOWN_HOSTS_VAR}"
+          else
+            echo "::warning title=SSH host keys not pinned::neither infra's registry/known_hosts nor the DEPLOY_KNOWN_HOSTS variable exist: ssh trusts on first use (accept-new) against this runner's persistent known_hosts (DEP-10)."
+            exit 0
+          fi
+          real_ssh="$(command -v ssh)"
+          dir="${RUNNER_TEMP}/ssh-pinned"
+          mkdir -p "${dir}/bin"
+          printf '%s\n' "${content}" > "${dir}/known_hosts"
+          if ! ssh-keygen -l -f "${dir}/known_hosts" >/dev/null 2>&1; then
+            echo "::error title=SSH host keys::${src} has no valid known_hosts line. Fix it, or remove it to fall back to trust-on-first-use."
+            exit 1
+          fi
+          cat > "${dir}/bin/ssh" <<EOF
+          #!/bin/sh
+          exec "${real_ssh}" -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${dir}/known_hosts" -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no "\$@"
+          EOF
+          chmod 0755 "${dir}/bin/ssh"
+          echo "${dir}/bin" >> "$GITHUB_PATH"
+          echo "SSH host keys pinned from ${src}: $(ssh-keygen -l -f "${dir}/known_hosts" | wc -l | tr -d ' ') key(s)"
+
+      - name: Last good release (for the rollback)
+        id: last-good
+        continue-on-error: true
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          CI: 'true'
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          SERVICE: ''
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # What the droplet runs as last-good, BEFORE touching it. If this
+          # deploy fails, the rollback redeploys that release from its own
+          # checkout (DEP-04). Read-only (`sl deploy <env> status`); a failure
+          # here only means the rollback falls back to images-only.
+          SL_BIN="$(yarn bin sl 2>/dev/null || true)"
+          echo "sl_bin=${SL_BIN}" >> "$GITHUB_OUTPUT"
+          last=""
+          if out="$(SL_FORMAT=json yarn sl deploy "${DEPLOY_ENV}" status --json 2>/dev/null | tail -n 1)"; then
+            last="$(printf '%s' "$out" | jq -r --arg svc "${SERVICE}" '
+              [(.data.servicios // [])[] | select($svc == "" or .service == $svc) | .lastGood // empty]
+              | unique | if length == 1 then .[0] else "" end' 2>/dev/null || true)"
+          fi
+          if [[ "${last}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "${last}" != "${TAG}" ]; then
+            echo "tag=${last}" >> "$GITHUB_OUTPUT"
+            echo "last good release in ${DEPLOY_ENV}: ${last}"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Rollback::no single last-good release to restore (read: '${last}'). If this deploy fails, the rollback puts the images back but NOT the fragment and env of that release (DEP-04)."
+          fi
 
       - name: sl deploy ${{ inputs.deploy-env }} --tag v${{ needs.version.outputs.version }}
+        id: sl-deploy
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
@@ -674,44 +913,119 @@ jobs:
           # Explícito y no sólo heredado del runner: evita el prompt interactivo
           # de confirmación en prod (`ctx.env.CI !== "true"` en deploy.ts).
           CI: 'true'
-        run: yarn sl deploy "${{ inputs.deploy-env }}" --tag "v${{ needs.version.outputs.version }}"
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: yarn sl deploy "${DEPLOY_ENV}" --tag "${TAG}" --yes
 
+      # The `<env>-stable` retag is bookkeeping on the registry, not part of
+      # the deploy: a `docker pull` of 400 MB that gets cut, or GHCR having a
+      # bad minute, used to turn a GOOD deploy red, fire the rollback (which
+      # recreates every service) and skip cac-apply and the retention
+      # (DEP-05(3)). Now it only warns. Rejected: `docker buildx imagetools
+      # create -t`, the registry-side retag the analysis suggests. Measured
+      # (buildx 0.33, --dry-run on a single-platform manifest): it wraps the
+      # image in a NEW index, so `<env>-stable` would get another digest and a
+      # manifest list, which breaks resuelto's size guard and the retention's
+      # "one version per image" reading.
       - name: Log in to GHCR
         if: success()
+        continue-on-error: true
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag as ${{ inputs.deploy-env }}-stable
+      - name: Tag as ${{ inputs.deploy-env }}-stable and latest
         # Sigue siendo un paso del workflow y no de `sl`: es una operación sobre
         # el REGISTRO de imágenes, no sobre un droplet, y el CLI no hace
         # operaciones de registro en esta etapa (regla de entrada del estándar).
+        # `latest` se mueve acá y no en build-images: es lo último que un
+        # deploy VALIDÓ, no lo último que se construyó (DEP-17(1)).
         if: success()
+        continue-on-error: true
         env:
           SERVICES: ${{ needs.matrix.outputs.services }}
           TAG: v${{ needs.version.outputs.version }}
           DEPLOY_ENV: ${{ inputs.deploy-env }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           for NAME in $(echo "$SERVICES" | jq -r '.[].name'); do
-            IMAGE="ghcr.io/${{ github.repository_owner }}/${NAME}"
+            IMAGE="ghcr.io/${OWNER}/${NAME}"
             docker pull "${IMAGE}:${TAG}"
-            docker tag "${IMAGE}:${TAG}" "${IMAGE}:${DEPLOY_ENV}-stable"
-            docker push "${IMAGE}:${DEPLOY_ENV}-stable"
+            for CHANNEL in "${DEPLOY_ENV}-stable" latest; do
+              docker tag "${IMAGE}:${TAG}" "${IMAGE}:${CHANNEL}"
+              docker push "${IMAGE}:${CHANNEL}"
+            done
           done
 
-      # El `Rollback on failure` NO necesita `SOPS_AGE_KEY`: `rollback` no
-      # descifra nada, sólo le pide al script que vuelva al último tag promovido.
+      # Qué: redeploy del último release bueno desde SU checkout (fragmento,
+      # env, borde y monitoreo de ese release, no sólo las imágenes: DEP-04),
+      # y si eso no se puede, el rollback de imágenes de siempre. Por eso
+      # ahora SÍ lleva SOPS_AGE_KEY: descifra el env de ese release.
+      #
+      # Cuándo: sólo si el paso `sl deploy` MISMO falló o se canceló.
+      #   - `failure()` a secas revertía también un deploy bueno cuando fallaba
+      #     algo después (el retag de `<env>-stable`), con downtime y sin
+      #     mover nada más (DEP-05(2)). `deploy-manual.yml` ya preguntaba por
+      #     el outcome del paso.
+      #   - `cancelled()`: un timeout del job o una cancelación a mano dejaban
+      #     el droplet a mitad de camino y SIN rollback, porque `failure()` no
+      #     es verdadero en una cancelación (DEP-13(2)). Actions le da a este
+      #     paso unos minutos después de la cancelación.
       - name: Rollback on failure
-        if: failure()
+        if: (failure() || cancelled()) && (steps.sl-deploy.outcome == 'failure' || steps.sl-deploy.outcome == 'cancelled')
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           SL_FORMAT: text
           CI: 'true'
-        run: yarn sl deploy "${{ inputs.deploy-env }}" rollback
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          SERVICE: ''
+          DEPLOY_OUTCOME: ${{ steps.sl-deploy.outcome }}
+          LAST_GOOD: ${{ steps.last-good.outputs.tag }}
+          SL_BIN: ${{ steps.last-good.outputs.sl_bin }}
+        run: |
+          set -euo pipefail
+          images_only() {
+            local args=("${DEPLOY_ENV}" rollback)
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            yarn sl deploy "${args[@]}" --yes
+          }
+          echo "::warning::the deploy ${DEPLOY_OUTCOME}: rolling back ${SERVICE:-the app} in ${DEPLOY_ENV}"
+
+          # A cancellation (job timeout, manual cancel) leaves minutes, not a
+          # full redeploy: images only. Same when there is nothing to restore.
+          if [ "${DEPLOY_OUTCOME}" = "cancelled" ] || [ -z "${LAST_GOOD}" ] || [ -z "${SL_BIN}" ]; then
+            echo "::warning::images-only rollback: the droplet keeps the fragment and env of the failed release (DEP-04)."
+            images_only
+            exit 0
+          fi
+
+          # Redeploy the last-good release from ITS checkout: its images, its
+          # compose fragment, its env (decrypted from its deploy/secrets), its
+          # edge and monitoring. The images-only rollback swapped the images
+          # back under the NEW fragment and env (appoint run 35770492946).
+          # `--skip-migrate`: a migration is not reverted, and the old
+          # migrator has nothing to add. The CURRENT `sl` runs it: an older
+          # descriptor read by a newer `sl` is the compatible direction.
+          WT="${RUNNER_TEMP}/last-good-${LAST_GOOD}"
+          if git fetch --quiet --depth=1 origin "refs/tags/${LAST_GOOD}:refs/tags/${LAST_GOOD}" \
+             && git worktree add --quiet --detach "${WT}" "${LAST_GOOD}"; then
+            args=("${DEPLOY_ENV}")
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            args+=(--tag "${LAST_GOOD}" --skip-migrate)
+            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}" --yes); then
+              echo "::warning::rolled back to ${LAST_GOOD}: images, fragment, env, edge and monitoring of that release. Migrations already applied stay applied."
+              exit 0
+            fi
+            echo "::error::redeploying ${LAST_GOOD} failed: falling back to the images-only rollback"
+          else
+            echo "::error::could not check out ${LAST_GOOD}: falling back to the images-only rollback"
+          fi
+          images_only
 
   # ============================================================
   # STAGE 5 — CaC (configuration as code)
@@ -751,16 +1065,39 @@ jobs:
   # IDACHU_CAC_KEY for a service token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
+  #
+  # API KEYS: NOT VERIFIED IN CI, ON PURPOSE (DEP-07(1) vs CAC-19). Neither
+  # CaC job has SOPS_AGE_KEY or sops, so every key reads as `unreadable` and
+  # the provider leaves the registered one alone: a rotated key committed to
+  # deploy/secrets reaches the droplet (the deploy decrypts it) but NOT idachu,
+  # and nothing turns red. Handing these jobs the age key is NOT the fix: with
+  # sl <= 1.37 a readable sops value is REGISTERED even with
+  # --no-create-keys (cli key-material.ts), so CI would become the one that
+  # rotates, after the deploy, with a 401 window; and in cac-plan any PR could
+  # decrypt the app's secrets. What CI needs before it can verify keys:
+  #   1. a cli mode that compares hashes and never registers (`--keys=verify`
+  #      or `--keys=skip`, CAC-17), failing on a mismatch;
+  #   2. then, in cac-apply ONLY (never cac-plan): the same pinned-sops step
+  #      as `deploy` and `SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}` in the
+  #      apply step's env, with `--no-create-keys --keys=verify`;
+  #   3. `unreadable` in CI becomes an error instead of a note.
+  # Until then both jobs assert that the age key is absent, and
+  # scripts/tests/check_workflows.py fails if a CaC job ever references it.
   # ============================================================
   cac-plan:
     name: CaC plan (${{ inputs.deploy-env }})
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     needs: static-checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (the branch's cac/stack.ts): read-only (DEP-15).
+    permissions:
+      contents: read
     timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       # Decide ACÁ si el job hace algo, antes de instalar nada y antes de pedirle
       # el registro a otro repo. Con el chequeo de la key metido más abajo, un
       # repo sin key igual hacía `yarn install` y el checkout de infra, y moría
@@ -770,13 +1107,20 @@ jobs:
         id: stack
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
+          # CAC-19: this job must not be able to decrypt deploy/secrets. With
+          # the age key, `sl cac` would register sops values (rotate) from CI.
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error title=CaC::SOPS_AGE_KEY is set in a CaC job: CI would register (rotate) API keys. See the comment on the CaC stage in app-release.yml."
+            exit 1
+          fi
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC plan skipped."
           elif [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -791,7 +1135,32 @@ jobs:
         if: steps.stack.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        if: steps.stack.outputs.present == 'true'
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
       # El registro de la plataforma. `sl cac` DERIVA la URL de cada provider
       # de `exports.<env>.URL` del descriptor de esa app, y para llegar al
       # descriptor necesita el registro: no lee `<PREFIJO>_URL` del entorno
@@ -804,16 +1173,20 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -826,6 +1199,7 @@ jobs:
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # `sl` collapses "plan with changes" and "plan with orphans" into the
           # same exit 2 (cli/src/cac/run.ts: "cualquier acción que no sea
@@ -842,12 +1216,12 @@ jobs:
           # payload, so the plan is re-run with --json and `data.orphans`
           # decides. A plain diff stays green; an orphan fails and is NAMED.
           set +e
-          yarn sl cac plan --env "${{ inputs.deploy-env }}"
+          yarn sl cac plan --env "${DEPLOY_ENV}"
           code=$?
           set -e
           [ "${code}" -ne 2 ] && exit "${code}"
 
-          plan_json="$(SL_FORMAT=json yarn sl cac plan --env "${{ inputs.deploy-env }}" --json 2>/dev/null | tail -n 1)"
+          plan_json="$(SL_FORMAT=json yarn sl cac plan --env "${DEPLOY_ENV}" --json 2>/dev/null | tail -n 1)"
 
           # A guard that breaks quietly is worse than no guard. The type check is
           # the point: `.data.orphans | length` on a MISSING key is null|length
@@ -861,12 +1235,12 @@ jobs:
           fi
 
           if [ "${orphans}" -gt 0 ]; then
-            echo "::error::CaC plan for '${{ inputs.deploy-env }}': ${orphans} orphan(s) — declared nowhere in cac/stack.ts but alive with managed_by=cac, i.e. changed by hand. Re-declare them or remove them with --prune:"
+            echo "::error::CaC plan for '${DEPLOY_ENV}': ${orphans} orphan(s) — declared nowhere in cac/stack.ts but alive with managed_by=cac, i.e. changed by hand. Re-declare them or remove them with --prune:"
             printf '%s' "${plan_json}" | jq -r '.data.orphans[] | "  - \(.provider) \(.kind) \(.name)"'
             exit 1
           fi
 
-          echo "::warning::CaC plan for '${{ inputs.deploy-env }}' has changes (no orphans). Read the diff above before merging."
+          echo "::warning::CaC plan for '${DEPLOY_ENV}' has changes (no orphans). Read the diff above before merging."
           exit 0
 
   cac-apply:
@@ -883,6 +1257,9 @@ jobs:
     # Bead sl-24x5.
     if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Talks to the providers with IDACHU_CAC_KEY; GITHUB_TOKEN only reads.
+    permissions:
+      contents: read
     timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
@@ -895,13 +1272,20 @@ jobs:
         id: stack
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
+          # CAC-19: this job must not be able to decrypt deploy/secrets. With
+          # the age key, `sl cac` would register sops values (rotate) from CI.
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error title=CaC::SOPS_AGE_KEY is set in a CaC job: CI would register (rotate) API keys. See the comment on the CaC stage in app-release.yml."
+            exit 1
+          fi
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC apply skipped."
           elif [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC apply skipped."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -916,7 +1300,32 @@ jobs:
         if: steps.stack.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        if: steps.stack.outputs.present == 'true'
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
       # Mismo motivo y mismo patrón que en `cac-plan`: `sl cac` deriva la URL
       # del provider del descriptor, y para eso necesita el registro.
       - name: Token para leer el registro
@@ -926,16 +1335,20 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -948,6 +1361,7 @@ jobs:
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # Exit 2 here means the apply worked but left orphans: resources the
           # stack no longer declares. It is a finding, not a failure, and this
@@ -955,11 +1369,11 @@ jobs:
           # are already out would say "the release broke" about something that
           # did not. It annotates instead; the orphans get cleaned in a PR.
           set +e
-          yarn sl cac apply --env "${{ inputs.deploy-env }}" --no-create-keys
+          yarn sl cac apply --env "${DEPLOY_ENV}" --no-create-keys
           code=$?
           set -e
           if [ "${code}" -eq 2 ]; then
-            echo "::warning::CaC apply for '${{ inputs.deploy-env }}' left orphans. Read the list above and clean them in a PR."
+            echo "::warning::CaC apply for '${DEPLOY_ENV}' left orphans. Read the list above and clean them in a PR."
             exit 0
           fi
           exit "${code}"
@@ -1044,11 +1458,23 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: write
           owner: ${{ github.repository_owner }}
-          # Acotado a lo que este job checkoutea y nada más: su propio repo, y
-          # `infra` para el registro de la plataforma (sparse, sólo registry/).
-          # Sin esta línea el token sale con acceso a los 41 repos de la org.
-          repositories: ${{ github.event.repository.name }},infra
+          # SÓLO el repo propio, con contents:write: commitea y pushea los
+          # recipients a su rama protegida. Antes era `<repo>,infra` con TODOS
+          # los permisos de la App — escritura en infra, cuyos rulesets la App
+          # saltea (SEC-02). El registro va con su propio token, abajo.
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Token para leer el registro
+        id: registry-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
+          owner: ${{ github.repository_owner }}
+          repositories: infra
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -1073,17 +1499,17 @@ jobs:
 
       # Sólo el registro: un checkout sparse de infra, no el repo entero.
       # Mismo `path: .infra-registry` que el job `deploy`, para que el nombre no
-      # dependa del job. Desde 2026-09-16 TODOS los checkouts del registro usan
-      # un token de la App; éste está acotado a `<repo>,infra` y no sólo a
-      # `infra` porque el mismo token pushea a la rama protegida de la app.
+      # dependa del job. Como en todos los checkouts del registro, con un token
+      # de la App de SÓLO lectura sobre infra, y sin dejarlo en .git/config.
       - name: Checkout del registro de la plataforma
         if: steps.secretos.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: ${{ github.repository_owner }}/infra
           ref: main
           path: .infra-registry
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.registry-token.outputs.token }}
           sparse-checkout: registry
           sparse-checkout-cone-mode: true
 
@@ -1100,30 +1526,32 @@ jobs:
         if: steps.secretos.outputs.present == 'true'
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
 
       - name: Install sops (pinned + checksum)
-        # Mismo pin y mismo checksum que el job `deploy` y que
-        # infra/.github/workflows/provision-env.yml.
+        # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         if: steps.secretos.outputs.present == 'true'
         run: |
           set -euo pipefail
           SOPS_VER=v3.11.0
           SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
-          SOPS_BIN="$HOME/.local/bin/sops-$SOPS_VER"
-          SOPS_TMP="${RUNNER_TEMP:-/tmp}/sops-$SOPS_VER.$$"
-          mkdir -p "$HOME/.local/bin"
-          sops_ok() { [ -f "$1" ] && echo "$SOPS_SHA  $1" | sha256sum -c - >/dev/null 2>&1; }
-          if ! sops_ok "$SOPS_BIN"; then
-            rm -f "$SOPS_BIN"
-            curl -sSL -o "$SOPS_TMP" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
-            sops_ok "$SOPS_TMP" || { echo "::error::el sops $SOPS_VER recien descargado NO coincide con el checksum fijado"; rm -f "$SOPS_TMP"; exit 1; }
-            install -m 0755 "$SOPS_TMP" "$SOPS_BIN"
-            rm -f "$SOPS_TMP"
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          sops_ok "$SOPS_BIN" || { echo "::error::el sops $SOPS_VER de $SOPS_BIN NO coincide con el checksum fijado"; exit 1; }
-          ln -sf "$SOPS_BIN" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       # SOPS_AGE_KEY (identidad ci-github-actions, secret de organización)
       # entra SÓLO por env y sólo acá: `sl secrets rotate` la usa para

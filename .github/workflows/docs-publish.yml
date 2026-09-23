@@ -16,11 +16,15 @@ name: Docs publish (reusable)
 # `docs.skylabs.digital`): no secret is needed for docs itself. GHCR_TOKEN is
 # only for installing the private @skylabs-digital/* packages.
 #
-# THE `sl` HERE IS THE REUSABLE'S, not the repo's pin (`cli-version`): each
-# app pins `sl` for its own deploy pipeline, and bumping that pin just so the
-# docs job can speak a newer protocol would change how it deploys. The
-# repo only needs `@skylabs-digital/docs-cac` (and `@skylabs-digital/cac`,
-# which an app with CaC already has) so `cac/docs.ts` resolves its imports.
+# WHICH `sl`: THE REPO'S OWN PIN when it has one that speaks `auth: github`
+# (>= 1.21.0), else `cli-version` when the caller passes it, else 1.37.0.
+# Until 2026-09-23 it was always the reusable's 1.21.0, and the descriptor
+# schema is strict: resuelto's descriptor uses `de:` (sl 1.27), 1.21 rejected
+# it, and resuelto's docs never published — hidden by `continue-on-error`
+# (DEP-19). The pin that wrote the descriptor is the one that can read it.
+# A library without the cli pinned gets the fallback. The repo also needs
+# `@skylabs-digital/docs-cac` (and `@skylabs-digital/cac`, which an app with
+# CaC already has) so `cac/docs.ts` resolves its imports.
 #
 # Standard: skylabs-workspace docs/standards/docs-publishing.md
 #
@@ -44,9 +48,12 @@ name: Docs publish (reusable)
 # would have broken the release of every app that has not granted it. Here the
 # grant lives on the caller's `docs` job only, and a repo opts in by adding it.
 #
-# NEVER FAILS A RELEASE: the job is `continue-on-error`. Documentation that
-# does not publish turns this job red and nothing else — the docs service being
-# down cannot undo a deploy that worked (docs spec §9).
+# A DOCS FAILURE IS RED, NOT HIDDEN. This job used to be `continue-on-error`,
+# so a descriptor that `sl` rejected left every release green and the docs
+# unpublished for weeks (DEP-19). It is still a job of its own after
+# `release`: a red here does not undo a deploy that worked (docs spec §9), it
+# just says, on the run, that the docs did not go out. Only the optional
+# rebuild request below stays `continue-on-error`: the site's cron covers it.
 # ============================================================================
 
 on:
@@ -65,9 +72,12 @@ on:
         type: string
         default: 'cac/docs.ts'
       cli-version:
-        description: 'The `sl` this job runs (>= 1.21.0: `auth: github`, `--no-create-keys` without a secrets sink, `X-Version`)'
+        description: >
+          Force this `sl` version (>= 1.21.0: `auth: github`, `--no-create-keys`
+          without a secrets sink, `X-Version`). Empty (default): the repo's own
+          pin when it has one >= 1.21.0, else 1.37.0.
         type: string
-        default: '1.37.0'
+        default: ''
       ref:
         description: >
           What to check out. Default `main`: after a release the version bump is
@@ -78,6 +88,14 @@ on:
     secrets:
       GHCR_TOKEN:
         description: 'Read access to the private @skylabs-digital/* npm packages'
+        required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
         required: false
       SEMANTIC_RELEASE_APP_ID:
         description: 'The org GitHub App, to ask the docs repo for a rebuild (optional: without it the site rebuilds on its 15-minute cron)'
@@ -91,7 +109,6 @@ jobs:
     name: Announce and publish docs
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     timeout-minutes: 15
-    continue-on-error: true
     permissions:
       contents: read
       id-token: write
@@ -117,9 +134,10 @@ jobs:
             exit 0
           fi
           if [ ! -f "$STACK_FILE" ]; then
-            echo "::warning title=docs::\`docs:\` is declared but $STACK_FILE does not exist: the section cannot be announced. See docs/standards/docs-publishing.md §5."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            # Red, not a warning: `docs:` is declared, so docs are expected and
+            # none would go out (DEP-19). Every repo that declares it has one.
+            echo "::error title=docs::\`docs:\` is declared but $STACK_FILE does not exist: the section cannot be announced. See docs/standards/docs-publishing.md §5."
+            exit 1
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
@@ -136,17 +154,35 @@ jobs:
         name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
       - if: steps.detect.outputs.publish == 'true'
-        name: Install sl ${{ inputs.cli-version }}
+        name: Resolve sl (the repo's pin, else cli-version, else 1.37.0)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
           CLI_VERSION: ${{ inputs.cli-version }}
+          MIN_VERSION: '1.21.0'
+          FALLBACK_VERSION: '1.37.0'
         run: |
           set -euo pipefail
-          npm install --prefix "$RUNNER_TEMP/sl" --no-save --no-audit --no-fund \
-            "@skylabs-digital/cli@${CLI_VERSION}"
-          echo "$RUNNER_TEMP/sl/node_modules/.bin" >> "$GITHUB_PATH"
+          bin="$RUNNER_TEMP/sl-bin"
+          mkdir -p "$bin"
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          pinned=""
+          if [ -f "$pj" ]; then pinned="$(node -p "require('./${pj}').version")"; fi
+          newest_of_two() { printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1; }
+          if [ -z "$CLI_VERSION" ] && [ -n "$pinned" ] && [ "$(newest_of_two "$MIN_VERSION" "$pinned")" = "$pinned" ]; then
+            # `yarn sl` resolves the repo's own pin from node_modules.
+            printf '#!/bin/sh\nexec yarn sl "$@"\n' > "$bin/sl"
+            chmod 0755 "$bin/sl"
+            echo "sl: this repo's pin, ${pinned}"
+          else
+            want="${CLI_VERSION:-$FALLBACK_VERSION}"
+            npm install --prefix "$RUNNER_TEMP/sl" --no-save --no-audit --no-fund \
+              "@skylabs-digital/cli@${want}"
+            ln -sf "$RUNNER_TEMP/sl/node_modules/.bin/sl" "$bin/sl"
+            echo "sl: ${want} (repo pin: ${pinned:-none})"
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
 
       # `--env prod`: the registry is global (one docs site for every
       # environment), the protocol just requires one. `--no-create-keys`: this
@@ -188,6 +224,8 @@ jobs:
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: docs
+          # A repository_dispatch needs contents:write on the target; nothing else.
+          permission-contents: write
 
       - if: steps.app-token.outputs.token != ''
         name: Ask docs to rebuild now

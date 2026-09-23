@@ -49,11 +49,20 @@ name: Deploy Manual (reusable)
 # son los válidos (`ordenarServicios`, cli/src/deploy/contexto.ts).
 #
 # ----------------------------------------------------------------------------
-# QUÉ REF SE DESPLIEGA. Este workflow NO pasa `ref:` al checkout: usa el que el
-# operador eligió en el desplegable "Use workflow from" de Actions, que acepta
-# ramas Y TAGS. Elegir ahí el mismo `vX.Y.Z` que se pone en `tag` es lo que
-# hace que el descriptor, el fragmento de compose y los secretos que se empujan
-# al droplet sean los de esa versión y no los de la punta de main.
+# QUÉ REF SE DESPLIEGA: el tag. El checkout usa `ref: ${{ inputs.tag }}`, así
+# que el descriptor, el fragmento de compose y los secretos que se empujan al
+# droplet son los de esa versión, que es para la que se construyó la imagen.
+# Hasta 2026-09-23 el checkout era el de "Use workflow from" (la rama), y un
+# rollback de emergencia a v5.20.0 disparado desde main desplegaba la imagen
+# vieja con el compose y el descriptor de main: una mezcla que no existió nunca
+# (DEP-09, idachu run 35390862198). `sl` >= 1.36 además se niega a desplegar un
+# checkout que no es el del tag, así que sin esto no se puede subir el pin.
+#
+# DESDE DÓNDE SE DISPARA: sólo desde la rama por defecto o desde un tag `v*`
+# ("Use workflow from"). El job `deploy` lleva SOPS_AGE_KEY y DEPLOY_SSH_KEY;
+# el caller que lo invoca tiene que ser el revisado, no el de una rama
+# cualquiera (SEC-01). Con el tag en el checkout, disparar desde main no cambia
+# nada de lo que se despliega.
 #
 # ----------------------------------------------------------------------------
 # SEGURIDAD. Ningún input llega a un `run:` ni a un comando remoto por `${{ }}`:
@@ -78,9 +87,9 @@ on:
         required: true
       tag:
         description: >
-          Tag de imagen a desplegar (`vX.Y.Z`, un sha, `latest`). Obligatorio:
-          sin tag el compose cae a `:latest`, que es el bug histórico que
-          `sl deploy` cierra.
+          Versión a desplegar, `vX.Y.Z`: es a la vez el tag de imagen y el tag
+          de git que se checkoutea. Ni `latest` ni un sha: el checkout tiene que
+          ser el del release para el que se construyó la imagen (DEP-09).
         type: string
         required: true
       service:
@@ -115,9 +124,25 @@ on:
         description: 'JSON array of runner labels'
         type: string
         default: '["self-hosted","linux","x64","skylabs"]'
+      sl-min-version:
+        description: >
+          The oldest `@skylabs-digital/cli` the repo may pin for the jobs that
+          run `sl` against an environment (deploy, CaC). Default: the fleet's
+          floor on 2026-09-23, so no app changes. Raise it to force a pin wave
+          (DEP-08(3)).
+        type: string
+        default: '1.22.0'
     secrets:
       GHCR_TOKEN:
         description: 'Classic PAT (read:packages) para `yarn install` de los @skylabs-digital/* y el fallback del checkout de infra'
+        required: false
+      NPM_READ_TOKEN:
+        description: >-
+          Read-only token (read:packages) for installing the private
+          @skylabs-digital/* packages. Preferred over GHCR_TOKEN wherever the
+          pipeline only READS packages, so the write-capable PAT stops reaching
+          every `yarn install` of every PR (DEP-11). Optional: without it, the
+          installs fall back to GHCR_TOKEN as before.
         required: false
       DEPLOY_SSH_KEY:
         description: 'SSH key del usuario deploy en los droplets (se mapea a SL_SSH_KEY)'
@@ -172,8 +197,24 @@ jobs:
           CONFIRM: ${{ inputs.confirm }}
           SERVICE: ${{ inputs.service }}
           TAG: ${{ inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+
+          # El tag es también el ref del checkout (DEP-09): sólo un release.
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Tag inválido::tag es \"${TAG}\"; tiene que ser un release vX.Y.Z (ni latest ni un sha): es el tag de imagen y el ref que se checkoutea."
+            exit 1
+          fi
+
+          # SEC-01: el caller que llega a SOPS_AGE_KEY es el revisado.
+          case "${GITHUB_REF}" in
+            "refs/heads/${DEFAULT_BRANCH}"|refs/tags/v*) ;;
+            *)
+              echo "::error title=Ref no permitido::Este deploy se disparó desde ${GITHUB_REF}. Elegí la rama por defecto (${DEFAULT_BRANCH}) o un tag v* en \"Use workflow from\": el job de deploy lleva las llaves de deploy, y el workflow que lo llama tiene que ser el revisado. Lo que se despliega sale del tag de todos modos."
+              exit 1
+              ;;
+          esac
 
           case "${DEPLOY_ENV}" in
             qa|prod) ;;
@@ -196,7 +237,8 @@ jobs:
             echo "| entorno | \`${DEPLOY_ENV}\` |"
             echo "| servicio | \`${SERVICE:-(la app entera)}\` |"
             echo "| tag | \`${TAG}\` |"
-            echo "| ref del checkout | \`${GITHUB_REF}\` |"
+            echo "| ref del checkout | \`${TAG}\` |"
+            echo "| disparado desde | \`${GITHUB_REF}\` |"
             echo "| lo pidió | @${GITHUB_ACTOR} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -211,22 +253,28 @@ jobs:
     permissions:
       contents: read
     # Un `sl deploy` colgado contra un droplet retendría un runner self-hosted
-    # hasta que alguien lo mate a mano. Un deploy real son minutos; 30 cubre el
-    # completo (migraciones + servicios + borde + monitoreo) con aire.
-    timeout-minutes: 30
-    # Un deploy a la vez por (entorno, servicio), y NUNCA se cancela a mitad:
-    # cancelar entre el `up` y el promote deja el droplet en un estado que nadie
-    # pidió. El release corre en su propio grupo (`release-*`) y podría solaparse
-    # con éste: la exclusión real la da el `flock` por app del lado del droplet
-    # (cli/src/deploy/plan.ts, conLock), no este grupo.
+    # hasta que alguien lo mate a mano. Un deploy real son minutos; 45 cubre el
+    # completo (migraciones + servicios + borde + monitoreo) y, si falla, el
+    # redeploy del último release bueno que hace el rollback (DEP-04).
+    timeout-minutes: 45
+    # Un deploy a la vez por (app, entorno), COMPARTIDO con el job `deploy` de
+    # app-release.yml, y NUNCA se cancela a mitad: cancelar entre el `up` y el
+    # promote deja el droplet en un estado que nadie pidió. Antes el grupo era
+    # por (entorno, servicio) y sólo de este workflow, confiando en el `flock`
+    # del droplet; pero ese lock dura UN comando, no el deploy entero, y un
+    # release podía swapear su fragmento+env en el medio (DEP-14(3)). GitHub
+    # guarda UN job pendiente por grupo: si se encolan dos detrás de uno que
+    # corre, el más viejo de los pendientes se cancela sin haber arrancado.
     concurrency:
-      group: deploy-manual-${{ inputs.environment }}-${{ inputs.service || 'app' }}
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
-      # Sin `ref:`: el checkout es el que el operador eligió en "Use workflow
-      # from" (rama o tag). Es de dónde salen deploy/skylabs.yaml,
-      # deploy/compose.yml y deploy/secrets/<env>.env.
+      # El tag, no la rama del dispatch (DEP-09): de acá salen
+      # deploy/skylabs.yaml, deploy/compose.yml y deploy/secrets/<env>.env, y
+      # tienen que ser los del release cuya imagen se despliega.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.tag }}
 
       # El registro de la plataforma: sparse checkout de infra, sólo registry/.
       # De ahí salen el bastión, las IPs privadas y los recipients age.
@@ -237,6 +285,7 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
           # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
           repositories: infra
@@ -244,24 +293,35 @@ jobs:
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
           token: ${{ steps.registry-token.outputs.token }}
 
       - name: Install sops (pinned + checksum)
-        # Mismo pin y mismo checksum que app-release.yml y que
-        # infra/.github/workflows/provision-env.yml.
+        # Mismo pin y mismo checksum que infra/.github/workflows/provision-env.yml.
+        # Se baja en CADA job al $RUNNER_TEMP del job y se verifica siempre.
+        # Antes vivía en $HOME/.local/bin, que sobrevive entre jobs en los
+        # runners self-hosted: un sops plantado ahí por cualquier otro job del
+        # pool quedaba en el PATH de un job con SOPS_AGE_KEY en el entorno, o
+        # sea el binario que descifra prod (sl-zldd, SEC-03, DEP-02(3)). Un
+        # $RUNNER_TEMP es del job y el runner lo vacía al terminar. No volver a
+        # cachearlo en $HOME: son ~20 MB por job, y el ahorro no paga el riesgo.
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          if [ ! -x "$HOME/.local/bin/sops-v3.11.0" ]; then
-            curl -sSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64"
-            echo "775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef  /tmp/sops" | sha256sum -c -
-            install -m 0755 /tmp/sops "$HOME/.local/bin/sops-v3.11.0"
+          SOPS_VER=v3.11.0
+          SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
+          SOPS_DIR="${RUNNER_TEMP}/sops-${SOPS_VER}"
+          mkdir -p "$SOPS_DIR"
+          curl -sSfL -o "$SOPS_DIR/sops" "https://github.com/getsops/sops/releases/download/$SOPS_VER/sops-$SOPS_VER.linux.amd64"
+          if ! echo "$SOPS_SHA  $SOPS_DIR/sops" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::the downloaded sops $SOPS_VER does NOT match the pinned checksum"
+            rm -f "$SOPS_DIR/sops"
+            exit 1
           fi
-          ln -sf "$HOME/.local/bin/sops-v3.11.0" "$HOME/.local/bin/sops"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod 0755 "$SOPS_DIR/sops"
+          echo "$SOPS_DIR" >> "$GITHUB_PATH"
 
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -275,7 +335,113 @@ jobs:
       - name: Install
         run: yarn install --immutable
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
+
+      # The `sl` this repo pins must be at least `sl-min-version` (DEP-08(3)).
+      # Fixes land in `sl` (the checkout guard of 1.36, the key hashes of
+      # 1.37) and reach no app until its pin moves; this is the lever that
+      # makes a floor real. The default is today's fleet floor, so nothing
+      # changes until the input (or the default) is raised.
+      - name: sl version floor
+        env:
+          SL_MIN_VERSION: ${{ inputs.sl-min-version }}
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/cli/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=sl::@skylabs-digital/cli is not installed: add it to devDependencies (docs/standards/sl-en-los-repos.md)."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "$SL_MIN_VERSION" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "$SL_MIN_VERSION" ]; then
+            echo "::error title=sl too old::this repo pins @skylabs-digital/cli ${have}; the pipeline needs >= ${SL_MIN_VERSION}. Raise the pin in package.json."
+            exit 1
+          fi
+          echo "sl ${have} (floor ${SL_MIN_VERSION})"
+
+      # SSH HOST KEYS PINNED, NOT TOFU (DEP-10). `sl` connects with
+      # `StrictHostKeyChecking=accept-new` against the runner's persistent
+      # ~/.ssh/known_hosts: the first contact accepts ANY key (a MITM there is
+      # silent) and, after the QA reset recreates a droplet on the same IP,
+      # the old key makes every deploy die with "Host key verification failed"
+      # until someone cleans nine hosts by hand.
+      #
+      # This step puts an `ssh` in front of the real one, for this job only,
+      # that forces `StrictHostKeyChecking=yes` against a known_hosts written
+      # to $RUNNER_TEMP. ssh keeps the FIRST value of each option, so ours win
+      # over `sl`'s `accept-new`; and `sl`'s ProxyCommand (the bastion hop)
+      # runs `ssh` through PATH too, so both hops are pinned. Sources, in order:
+      #   1. registry/known_hosts in infra (the sparse checkout above): what
+      #      infra would publish on every apply, so it survives recreation;
+      #   2. the DEPLOY_KNOWN_HOSTS variable (org, repo or environment);
+      #   3. neither: today's behaviour, with a warning.
+      # The format is plain known_hosts: `10.10.10.2 ssh-ed25519 AAAA…` for a
+      # droplet, `[bastion.host]:2222 ssh-ed25519 AAAA…` for the bastion.
+      - name: Pin SSH host keys
+        env:
+          KNOWN_HOSTS_VAR: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          REGISTRY_KNOWN_HOSTS: ${{ github.workspace }}/.infra-registry/registry/known_hosts
+        run: |
+          set -euo pipefail
+          if [ -s "${REGISTRY_KNOWN_HOSTS}" ]; then
+            src="registry/known_hosts (infra)"
+            content="$(cat "${REGISTRY_KNOWN_HOSTS}")"
+          elif [ -n "${KNOWN_HOSTS_VAR}" ]; then
+            src="the DEPLOY_KNOWN_HOSTS variable"
+            content="${KNOWN_HOSTS_VAR}"
+          else
+            echo "::warning title=SSH host keys not pinned::neither infra's registry/known_hosts nor the DEPLOY_KNOWN_HOSTS variable exist: ssh trusts on first use (accept-new) against this runner's persistent known_hosts (DEP-10)."
+            exit 0
+          fi
+          real_ssh="$(command -v ssh)"
+          dir="${RUNNER_TEMP}/ssh-pinned"
+          mkdir -p "${dir}/bin"
+          printf '%s\n' "${content}" > "${dir}/known_hosts"
+          if ! ssh-keygen -l -f "${dir}/known_hosts" >/dev/null 2>&1; then
+            echo "::error title=SSH host keys::${src} has no valid known_hosts line. Fix it, or remove it to fall back to trust-on-first-use."
+            exit 1
+          fi
+          cat > "${dir}/bin/ssh" <<EOF
+          #!/bin/sh
+          exec "${real_ssh}" -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${dir}/known_hosts" -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no "\$@"
+          EOF
+          chmod 0755 "${dir}/bin/ssh"
+          echo "${dir}/bin" >> "$GITHUB_PATH"
+          echo "SSH host keys pinned from ${src}: $(ssh-keygen -l -f "${dir}/known_hosts" | wc -l | tr -d ' ') key(s)"
+
+      - name: Last good release (for the rollback)
+        id: last-good
+        if: inputs.rollback-on-failure
+        continue-on-error: true
+        env:
+          SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          CI: 'true'
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # What the droplet runs as last-good, BEFORE touching it. If this
+          # deploy fails, the rollback redeploys that release from its own
+          # checkout (DEP-04). Read-only (`sl deploy <env> status`); a failure
+          # here only means the rollback falls back to images-only.
+          SL_BIN="$(yarn bin sl 2>/dev/null || true)"
+          echo "sl_bin=${SL_BIN}" >> "$GITHUB_OUTPUT"
+          last=""
+          if out="$(SL_FORMAT=json yarn sl deploy "${DEPLOY_ENV}" status --json 2>/dev/null | tail -n 1)"; then
+            last="$(printf '%s' "$out" | jq -r --arg svc "${SERVICE}" '
+              [(.data.servicios // [])[] | select($svc == "" or .service == $svc) | .lastGood // empty]
+              | unique | if length == 1 then .[0] else "" end' 2>/dev/null || true)"
+          fi
+          if [[ "${last}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "${last}" != "${TAG}" ]; then
+            echo "tag=${last}" >> "$GITHUB_OUTPUT"
+            echo "last good release in ${DEPLOY_ENV}: ${last}"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Rollback::no single last-good release to restore (read: '${last}'). If this deploy fails, the rollback puts the images back but NOT the fragment and env of that release (DEP-04)."
+          fi
 
       - name: sl deploy
         id: deploy
@@ -305,31 +471,69 @@ jobs:
           if [ "${SKIP_MIGRATE}" = "true" ]; then
             ARGS+=(--skip-migrate)
           fi
-          echo "yarn sl deploy ${ARGS[*]}"
-          yarn sl deploy "${ARGS[@]}"
+          echo "yarn sl deploy ${ARGS[*]} --yes"
+          yarn sl deploy "${ARGS[@]}" --yes
 
       # Mismo rollback que el job `deploy` de app-release.yml, y por el mismo
-      # motivo: un deploy que falló deja la imagen rota sirviendo tráfico. NO
-      # necesita SOPS_AGE_KEY — `rollback` no descifra nada, le pide al droplet
-      # que vuelva al último tag promovido.
+      # motivo: un deploy que falló deja la imagen rota sirviendo tráfico.
+      # Redeploya el último release bueno desde SU checkout (fragmento y env
+      # de ese release, DEP-04), o si no se puede, sólo las imágenes. Lleva
+      # SOPS_AGE_KEY porque descifra el env de ese release.
       #
-      # `steps.deploy.outcome != 'skipped'`: si lo que falló fue el checkout, el
-      # install o sops, no se desplegó nada y un rollback DEGRADARÍA un servicio
-      # sano. Sólo se revierte si el deploy llegó a correr.
+      # Sólo si el paso `sl deploy` MISMO falló o se canceló: si lo que falló
+      # fue el checkout, el install o sops, no se desplegó nada y un rollback
+      # DEGRADARÍA un servicio sano. `cancelled()`: un timeout o una
+      # cancelación a mano a mitad del deploy también revierten (DEP-13(2));
+      # `failure()` solo no es verdadero en una cancelación.
       - name: Rollback on failure
-        if: ${{ failure() && inputs.rollback-on-failure && steps.deploy.outcome != 'skipped' }}
+        if: ${{ (failure() || cancelled()) && inputs.rollback-on-failure && (steps.deploy.outcome == 'failure' || steps.deploy.outcome == 'cancelled') }}
         env:
           SL_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           SL_FORMAT: text
           CI: 'true'
           DEPLOY_ENV: ${{ inputs.environment }}
           SERVICE: ${{ inputs.service }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          LAST_GOOD: ${{ steps.last-good.outputs.tag }}
+          SL_BIN: ${{ steps.last-good.outputs.sl_bin }}
         run: |
           set -euo pipefail
-          echo "::warning::El deploy falló — revirtiendo ${SERVICE:-la app} en ${DEPLOY_ENV}"
-          ARGS=("${DEPLOY_ENV}" rollback)
-          if [ -n "${SERVICE}" ]; then
-            ARGS+=("${SERVICE}")
+          images_only() {
+            local args=("${DEPLOY_ENV}" rollback)
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            yarn sl deploy "${args[@]}" --yes
+          }
+          echo "::warning::the deploy ${DEPLOY_OUTCOME}: rolling back ${SERVICE:-the app} in ${DEPLOY_ENV}"
+
+          # A cancellation (job timeout, manual cancel) leaves minutes, not a
+          # full redeploy: images only. Same when there is nothing to restore.
+          if [ "${DEPLOY_OUTCOME}" = "cancelled" ] || [ -z "${LAST_GOOD}" ] || [ -z "${SL_BIN}" ]; then
+            echo "::warning::images-only rollback: the droplet keeps the fragment and env of the failed release (DEP-04)."
+            images_only
+            exit 0
           fi
-          yarn sl deploy "${ARGS[@]}"
+
+          # Redeploy the last-good release from ITS checkout: its images, its
+          # compose fragment, its env (decrypted from its deploy/secrets), its
+          # edge and monitoring. The images-only rollback swapped the images
+          # back under the NEW fragment and env (appoint run 35770492946).
+          # `--skip-migrate`: a migration is not reverted, and the old
+          # migrator has nothing to add. The CURRENT `sl` runs it: an older
+          # descriptor read by a newer `sl` is the compatible direction.
+          WT="${RUNNER_TEMP}/last-good-${LAST_GOOD}"
+          if git fetch --quiet --depth=1 origin "refs/tags/${LAST_GOOD}:refs/tags/${LAST_GOOD}" \
+             && git worktree add --quiet --detach "${WT}" "${LAST_GOOD}"; then
+            args=("${DEPLOY_ENV}")
+            if [ -n "${SERVICE}" ]; then args+=("${SERVICE}"); fi
+            args+=(--tag "${LAST_GOOD}" --skip-migrate)
+            if (cd "${WT}" && node "${SL_BIN}" deploy "${args[@]}" --yes); then
+              echo "::warning::rolled back to ${LAST_GOOD}: images, fragment, env, edge and monitoring of that release. Migrations already applied stay applied."
+              exit 0
+            fi
+            echo "::error::redeploying ${LAST_GOOD} failed: falling back to the images-only rollback"
+          else
+            echo "::error::could not check out ${LAST_GOOD}: falling back to the images-only rollback"
+          fi
+          images_only

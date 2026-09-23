@@ -37,8 +37,9 @@ Add a `docs` job to `release.yml`, next to the job that calls the release reusab
 - `needs:` names the job that calls `app-release.yml` or `lib-release.yml`. The docs publish
   after a successful release, so what is published matches what shipped.
 - `id-token: write` is granted **on this job only** — see below why this is a separate reusable.
-- **It never fails a release.** The job is `continue-on-error`: if the docs service is down, only
-  this job turns red.
+- **A docs failure is red, and visible.** It is a job of its own after the release, so a red here
+  never undoes a deploy — but it is no longer `continue-on-error`: that setting kept releases
+  green while resuelto's docs did not publish for weeks (DEP-19).
 
 A repo with no release workflow adds `.github/workflows/docs.yml` that calls the same reusable on
 pushes to `main` touching `docs/public/**` or `cac/docs.ts`.
@@ -48,9 +49,9 @@ pushes to `main` touching `docs/public/**` or `cac/docs.ts`.
 | Step | What |
 |---|---|
 | Checkout | `ref` (default `main`): after a release, the version bump is a later commit than the one that triggered the run, and the version shown on the docs status page comes from `package.json` |
-| Detect | No `docs:` in `deploy/skylabs.yaml` → a notice and the job ends green. `docs:` declared but no `cac/docs.ts` → a warning and the job ends |
+| Detect | No `docs:` in `deploy/skylabs.yaml` → a notice and the job ends green. `docs:` declared but no `cac/docs.ts` → an error: docs were expected and none would go out |
 | Install | `yarn install --immutable`, so `cac/docs.ts` can resolve its imports |
-| Install `sl` | `@skylabs-digital/cli@<cli-version>` into `$RUNNER_TEMP` — the reusable's own `sl`, not the repo's pin |
+| Resolve `sl` | The repo's own pin (`yarn sl`) when it has one ≥ 1.21.0; otherwise `@skylabs-digital/cli@<cli-version>`, or 1.37.0, into `$RUNNER_TEMP` |
 | Announce | `sl cac apply --env prod --file <stack-file> --no-create-keys` |
 | Publish | `sl docs sync` |
 
@@ -62,7 +63,7 @@ protocol just requires one. `--no-create-keys` because the stack has no keys, an
 
 | Input | Type | Default | Meaning |
 |---|---|---|---|
-| `cli-version` | string | `1.37.0` | The `sl` this job runs. Needs 1.21.0 or later: `auth: github`, `--no-create-keys` without a secrets destination, the version header. From 1.36.0 the `sl cac apply` step also requires a clean checkout of `main` (no tracked file modified by `yarn install`) |
+| `cli-version` | string | `''` | Force this `sl` version (1.21.0 or later: `auth: github`, `--no-create-keys` without a secrets destination, the version header). Empty: the repo's own pin, else 1.37.0. From 1.36.0 the `sl cac apply` step also requires a clean checkout of `main` (no tracked file modified by `yarn install`) |
 | `stack-file` | string | `cac/docs.ts` | The stack that announces the section |
 | `ref` | string | `main` | What to check out |
 | `node-version` | string | `24` | Node for the job |
@@ -70,10 +71,13 @@ protocol just requires one. `--no-create-keys` because the stack has no keys, an
 
 Secret: `GHCR_TOKEN` (optional, through `secrets: inherit`).
 
-## Why its own `sl`
+## Which `sl`
 
-The apps pin `sl` 1.8–1.12 for their deploy pipelines. Bumping that pin just so the docs job can
-speak `auth: github` would change how they deploy. With its own `sl`, a repo adopting docs only
+The descriptor schema is strict: a descriptor written for a newer `sl` is rejected by an older
+one. Until 2026-09-23 this job always ran its own 1.21.0, and resuelto's descriptor (which uses
+`de:`, from 1.27) never published. So the job now runs **the repo's own pin** when there is one
+that speaks `auth: github` (every app pins 1.22 or later): the `sl` that deploys the descriptor is
+the one that reads it. A library without the cli pinned gets 1.37.0. A repo adopting docs only
 adds `@skylabs-digital/docs-cac` as a devDependency (plus `@skylabs-digital/cac` if it does not
 have it yet — 1.x or 2.x both work).
 

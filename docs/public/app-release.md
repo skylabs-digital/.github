@@ -29,9 +29,9 @@ flowchart TD
 | `matrix` | every event but `repository_dispatch` | `yarn sl app services --json` reads the services from the descriptor. The list drives the build matrix and the images Grype scans. |
 | `static-checks` | pull requests and pushes | `yarn ci` once, repo-wide: typecheck, lint, test, build. |
 | `security` | every event but `repository_dispatch` | Calls [`security.yml@main`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
-| `version` | push to `main`, not on a `chore(release):` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
-| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`. |
-| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable`. On failure, `sl deploy <env> rollback`. |
+| `version` | push to `main`, not on the bumper's own `chore(release): v…` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
+| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z` and `<sha>`, where `<sha>` (and the `BUILD_COMMIT` build-arg) is the commit the tag points at. `latest` moves only after a successful deploy, with `<env>-stable` (with `deploy: false`, here). |
+| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable` and `latest` (a failed retag only warns). If `sl deploy` itself fails or is cancelled, it rolls back — see [Rollback](#rollback). |
 | `cac-plan` | pull requests | `yarn cac plan --env <env>` when the repo has `cac/stack.ts`. |
 | `cac-apply` | after a successful (or skipped) deploy | `yarn cac apply --env <env> --no-create-keys` when the repo has `cac/stack.ts`. |
 | `secrets-rotate` | `repository_dispatch: skylabs-operators-changed` only | Re-encrypts `deploy/secrets/*.env` for the current operators (`yarn sl secrets rotate`) and commits `chore(secrets): recipients del registro [skip ci]`. |
@@ -56,12 +56,55 @@ The `version` job is the only place a version number is decided.
 |---|---|
 | Any type with `!` (`feat!:`, `fix(api)!:`) or a `BREAKING CHANGE:` footer | major |
 | `feat` | minor |
-| `fix`, `perf`, `refactor` | patch |
+| `fix`, `perf`, `refactor`, `revert` (and GitHub's `Revert "…"`) | patch |
+| `chore(deps)`, `chore(deps-dev)`, `build(deps)`, `build(deps-dev)` | patch — a dependency bump changes what runs |
 | Anything else (`chore`, `docs`, `test`…) | no release — nothing is built or deployed |
 
-If the tag already exists it bumps the patch until it finds a free one. If `main` moves while it
-pushes, it discards its commit, resets to the fresh `main` and **recomputes** — up to five
-times. When a concurrent release already covered everything, it exits cleanly with no release.
+If the tag already exists it bumps the patch until it finds a free one.
+
+**A run only publishes what it validated.** If `main` has moved past the commit the run was
+started for, and the new commits trigger CI, the run publishes nothing and ends green with
+`bumped=false` and a notice: the run of the newest commit validates and releases everything
+(GitHub only cancels older *pending* runs). If the only new commits are `[skip ci]` ones (a
+`secrets-rotate` commit), no newer run will come, so the job recomputes on top of them — up to
+five times. When a concurrent release already covered everything, it exits cleanly with no
+release.
+
+## Rollback
+
+Before deploying, the job reads what the droplet runs as last-good (`sl deploy <env> status`).
+When `sl deploy` fails, the rollback **redeploys that release from its own checkout** —
+`sl deploy <env> --tag <last-good> --skip-migrate` in a worktree of the last-good tag — so the
+images, the compose fragment, the env, the edge and the monitoring all go back together.
+The plain `sl deploy <env> rollback` only swapped the images, under the fragment and env of the
+release that failed (DEP-04: appoint run 35770492946).
+
+It falls back to the images-only rollback when:
+
+- the deploy was **cancelled** (a timeout leaves minutes, not a full redeploy);
+- the services do not agree on a single last-good `vX.Y.Z`, or it could not be read;
+- the redeploy of the last-good release fails.
+
+Migrations are never reverted: a migration must stay compatible with the previous image
+(expand/contract). The rollback only runs when the `sl deploy` step itself failed; a failure
+after it (the `<env>-stable` retag) does not undo a good deploy.
+
+## SSH host keys
+
+`sl` connects with `StrictHostKeyChecking=accept-new` against the runner's persistent
+`known_hosts`: the first contact trusts any key, and a droplet recreated on the same IP (the QA
+reset) breaks every deploy with *Host key verification failed*. The deploy jobs therefore pin the
+host keys for the job's own `ssh`, both hops included (the bastion's `ProxyCommand` finds `ssh`
+through the same `PATH`), with `StrictHostKeyChecking=yes`. The keys come from, in order:
+
+1. `registry/known_hosts` in `infra` (the registry the job already checks out), which infra can
+   republish on every apply so it survives droplet recreation;
+2. the `DEPLOY_KNOWN_HOSTS` Actions variable (organization, repository or environment);
+3. neither: trust on first use, as before, with a warning on the run.
+
+The format is plain `known_hosts`: `10.10.10.2 ssh-ed25519 AAAA…` for a droplet and
+`[bastion.example]:2222 ssh-ed25519 AAAA…` for a bastion on another port. A value with no valid
+line fails the deploy.
 
 ## Inputs
 
@@ -71,6 +114,7 @@ times. When a concurrent release already covered everything, it exits cleanly wi
 | `node-version` | string | `24` | Node for every job. |
 | `runner-labels` | string (JSON) | `["self-hosted","linux","x64","skylabs"]` | Where the jobs run. |
 | `deploy` | boolean | `true` | `false` runs everything except the deploy (CI, version, image, security, CaC). For a service whose host is not a stack of the descriptor and deploys with its own job. |
+| `sl-min-version` | string | `1.22.0` | The oldest `@skylabs-digital/cli` the repo may pin for `deploy`, `cac-plan` and `cac-apply`; older fails the job. The default is the fleet's floor on 2026-09-23: raise it to force a pin wave. |
 
 ## Outputs
 
@@ -95,7 +139,7 @@ Every image is built with two build arguments:
 | Build arg | Value |
 |---|---|
 | `APP_VERSION` | `vX.Y.Z`, the version `version` just tagged |
-| `BUILD_COMMIT` | the `main` commit being built |
+| `BUILD_COMMIT` | the commit being built: the one the release tag points at |
 
 A Dockerfile that wants them declares `ARG APP_VERSION` / `ARG BUILD_COMMIT` and fixes them as
 `ENV`. Runtime code reads the version in this order, never from `package.json` in production:
