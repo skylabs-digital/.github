@@ -79,9 +79,59 @@ def check_actions_pinned_by_sha(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+def check_pin_comments_agree(wfs: dict[str, dict]) -> list[str]:
+    """One SHA, one tag. `de0fac2…  # v6.0.2` here and `# v4.3.0` there means
+    one of the two comments lies, and the next person bumps the wrong one."""
+    seen: dict[str, tuple[str, str]] = {}
+    errors = []
+    for name in wfs:
+        for n, line in enumerate(raw_lines(name), 1):
+            m = re.search(r"uses:\s*([^@\s]+)@([0-9a-f]{40})\s*#\s*(v[\w.-]+)", line)
+            if not m:
+                continue
+            key = f"{m.group(1)}@{m.group(2)}"
+            where = f"{name}:{n}"
+            if key in seen and seen[key][0] != m.group(3):
+                errors.append(
+                    f"{where}: {m.group(1)} {m.group(2)[:7]} is `{m.group(3)}` here "
+                    f"but `{seen[key][0]}` at {seen[key][1]}"
+                )
+            seen.setdefault(key, (m.group(3), where))
+    return errors
+
+
+def run_scripts(wfs: dict[str, dict]):
+    """(workflow, job, step name, run text) for every `run:` step."""
+    for name, wf in wfs.items():
+        for job_id, job in jobs(wf).items():
+            for s in steps(job):
+                if "run" in s:
+                    yield name, job_id, s.get("name") or s.get("id") or s["run"][:30], s["run"]
+
+
+def check_no_unverified_installs(wfs: dict[str, dict]) -> list[str]:
+    """No `curl | sh`, no `sudo` and no unpinned `yarn dlx`: every binary a job
+    runs is pinned, checksummed and lives in the job's own $RUNNER_TEMP. The
+    runners are persistent hosts (DEP-02): /usr/local/bin outlives the job."""
+    errors = []
+    for name, job_id, step, run in run_scripts(wfs):
+        for line in run.splitlines():
+            code = line.split("#", 1)[0]
+            if re.search(r"\|\s*(sh|bash)\b", code):
+                errors.append(f"{name}:{job_id}:{step}: pipes a download into a shell")
+            if re.search(r"(^|[;&|\s])sudo\s", code):
+                errors.append(f"{name}:{job_id}:{step}: uses sudo")
+            m = re.search(r"yarn dlx ([^\s;]+)", code)
+            if m and not re.search(r"@\d+\.\d+\.\d+$", m.group(1)):
+                errors.append(f"{name}:{job_id}:{step}: `yarn dlx {m.group(1)}` has no exact version")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
+    check_pin_comments_agree,
+    check_no_unverified_installs,
 ]
 
 

@@ -336,7 +336,10 @@ jobs:
       - name: Semantic release
         run: |
           for attempt in 1 2 3; do
-            if yarn dlx semantic-release; then
+            # Exact version (SEC-12(3)): an unpinned `yarn dlx` runs whatever
+            # npm says is latest today, with the App token in the environment.
+            # 25.0.9 is the one the libs already declare in devDependencies.
+            if yarn dlx semantic-release@25.0.9; then
               exit 0
             fi
             git fetch --tags --force --prune --prune-tags --quiet origin main

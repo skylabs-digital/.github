@@ -56,7 +56,7 @@ jobs:
       summary_b64: ${{ steps.gate.outputs.summary_b64 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       # OSV-Scanner has no native "--only-fixed" (unlike Grype), so run it
       # non-blocking with JSON output and let the gate step below decide.
@@ -178,7 +178,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
 
@@ -200,11 +200,17 @@ jobs:
               exit 1
               ;;
           esac
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}" -o gitleaks.tgz
-          echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
-          tar -xzf gitleaks.tgz gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
-          gitleaks version
+          # Into this job's $RUNNER_TEMP, not /usr/local/bin with sudo: the
+          # runners are persistent hosts (DEP-02), and a binary in a shared
+          # path outlives the job and gets reused by the next one unverified.
+          BIN_DIR="${RUNNER_TEMP}/gitleaks-${VERSION}"
+          mkdir -p "${BIN_DIR}"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}" -o "${BIN_DIR}/gitleaks.tgz"
+          echo "${SHA256}  ${BIN_DIR}/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "${BIN_DIR}/gitleaks.tgz" -C "${BIN_DIR}" gitleaks
+          rm -f "${BIN_DIR}/gitleaks.tgz"
+          echo "${BIN_DIR}" >> "$GITHUB_PATH"
+          "${BIN_DIR}/gitleaks" version
 
       # Full-history secret scan. A leaked secret stays leaked, so we keep
       # exit-code 1 on real findings — but allow callers to suppress confirmed
@@ -284,7 +290,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v3.11.1
@@ -302,11 +308,37 @@ jobs:
           secrets: |
             npm_token=${{ steps.npm.outputs.token }}
 
+      # The release tarball with a pinned checksum, into $RUNNER_TEMP. It used
+      # to be `curl …/install.sh | sh -s -- -b /usr/local/bin`: a script run
+      # unverified, writing into a path every later job on this persistent
+      # host trusts (DEP-16(4)). Checksums from grype_0.111.1_checksums.txt of
+      # the GitHub release, and re-hashed from the downloaded tarball.
       - name: Install Grype v0.111.1
         run: |
           set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.111.1/install.sh | sh -s -- -b /usr/local/bin v0.111.1
-          grype version
+          VERSION=0.111.1
+          case "$(uname -m)" in
+            x86_64)
+              ASSET=grype_${VERSION}_linux_amd64.tar.gz
+              SHA256=2bc0bc60f1f4e10b0429f5e84517ec4cf0d769d2ef66875c64fc6640e136fd8f
+              ;;
+            aarch64|arm64)
+              ASSET=grype_${VERSION}_linux_arm64.tar.gz
+              SHA256=ba126117fbe14ad9797a3080812f4398742dfad91208c87ce8d44717f6e1fbc5
+              ;;
+            *)
+              echo "Unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="${RUNNER_TEMP}/grype-${VERSION}"
+          mkdir -p "${BIN_DIR}"
+          curl -sSfL "https://github.com/anchore/grype/releases/download/v${VERSION}/${ASSET}" -o "${BIN_DIR}/grype.tgz"
+          echo "${SHA256}  ${BIN_DIR}/grype.tgz" | sha256sum -c -
+          tar -xzf "${BIN_DIR}/grype.tgz" -C "${BIN_DIR}" grype
+          rm -f "${BIN_DIR}/grype.tgz"
+          echo "${BIN_DIR}" >> "$GITHUB_PATH"
+          "${BIN_DIR}/grype" version
 
       # Scan to JSON (non-blocking), then apply the same fixability policy as
       # the OSV gate: BLOCK only on FIXABLE findings >= grype-fail-on-severity;
