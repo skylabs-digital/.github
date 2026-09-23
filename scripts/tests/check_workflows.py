@@ -346,6 +346,31 @@ def check_deploy_keys_stay_where_they_are(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+# `run:` steps whose whole point is to run shell the CALLER wrote: the input
+# is code by contract, from the caller's own reviewed workflow file.
+SHELL_INPUTS_ON_PURPOSE = {
+    ("foreign-timezone.yml", "${{ inputs.setup-command }}"),
+    ("foreign-timezone.yml", "${{ inputs.test-command }}"),
+    ("lib-release.yml", "${{ inputs.extra-ci-steps }}"),
+    ("lib-release.yml", "${{ inputs.extra-ci-steps-post-build }}"),
+}
+
+
+def check_no_expressions_in_shell(wfs: dict[str, dict]) -> list[str]:
+    """No `${{ }}` inside a `run:`: the template engine substitutes it before
+    any shell exists, so quoting does not protect anything. Values reach the
+    shell through `env:`. `github.event.*` (PR titles, branch names, commit
+    messages) is the dangerous one; the rule covers every expression so a
+    safe-looking one cannot turn into a dangerous one by a later edit."""
+    errors = []
+    for name, job_id, step, run in run_scripts(wfs):
+        for expr in re.findall(r"\$\{\{[^}]*\}\}", run):
+            if (name, expr) in SHELL_INPUTS_ON_PURPOSE:
+                continue
+            errors.append(f"{name}:{job_id}:{step}: `{expr}` is interpolated into the shell; pass it through env:")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -361,6 +386,7 @@ CHECKS = [
     check_app_tokens_are_narrow,
     check_untrusted_checkouts_keep_no_token,
     check_deploy_keys_stay_where_they_are,
+    check_no_expressions_in_shell,
 ]
 
 

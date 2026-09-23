@@ -902,7 +902,9 @@ jobs:
           # Explícito y no sólo heredado del runner: evita el prompt interactivo
           # de confirmación en prod (`ctx.env.CI !== "true"` en deploy.ts).
           CI: 'true'
-        run: yarn sl deploy "${{ inputs.deploy-env }}" --tag "v${{ needs.version.outputs.version }}"
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: yarn sl deploy "${DEPLOY_ENV}" --tag "${TAG}"
 
       # The `<env>-stable` retag is bookkeeping on the registry, not part of
       # the deploy: a `docker pull` of 400 MB that gets cut, or GHCR having a
@@ -1094,6 +1096,7 @@ jobs:
         id: stack
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # CAC-19: this job must not be able to decrypt deploy/secrets. With
           # the age key, `sl cac` would register sops values (rotate) from CI.
@@ -1106,7 +1109,7 @@ jobs:
             echo "No cac/stack.ts in this repo: CaC plan skipped."
           elif [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -1185,6 +1188,7 @@ jobs:
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # `sl` collapses "plan with changes" and "plan with orphans" into the
           # same exit 2 (cli/src/cac/run.ts: "cualquier acción que no sea
@@ -1201,12 +1205,12 @@ jobs:
           # payload, so the plan is re-run with --json and `data.orphans`
           # decides. A plain diff stays green; an orphan fails and is NAMED.
           set +e
-          yarn sl cac plan --env "${{ inputs.deploy-env }}"
+          yarn sl cac plan --env "${DEPLOY_ENV}"
           code=$?
           set -e
           [ "${code}" -ne 2 ] && exit "${code}"
 
-          plan_json="$(SL_FORMAT=json yarn sl cac plan --env "${{ inputs.deploy-env }}" --json 2>/dev/null | tail -n 1)"
+          plan_json="$(SL_FORMAT=json yarn sl cac plan --env "${DEPLOY_ENV}" --json 2>/dev/null | tail -n 1)"
 
           # A guard that breaks quietly is worse than no guard. The type check is
           # the point: `.data.orphans | length` on a MISSING key is null|length
@@ -1220,12 +1224,12 @@ jobs:
           fi
 
           if [ "${orphans}" -gt 0 ]; then
-            echo "::error::CaC plan for '${{ inputs.deploy-env }}': ${orphans} orphan(s) — declared nowhere in cac/stack.ts but alive with managed_by=cac, i.e. changed by hand. Re-declare them or remove them with --prune:"
+            echo "::error::CaC plan for '${DEPLOY_ENV}': ${orphans} orphan(s) — declared nowhere in cac/stack.ts but alive with managed_by=cac, i.e. changed by hand. Re-declare them or remove them with --prune:"
             printf '%s' "${plan_json}" | jq -r '.data.orphans[] | "  - \(.provider) \(.kind) \(.name)"'
             exit 1
           fi
 
-          echo "::warning::CaC plan for '${{ inputs.deploy-env }}' has changes (no orphans). Read the diff above before merging."
+          echo "::warning::CaC plan for '${DEPLOY_ENV}' has changes (no orphans). Read the diff above before merging."
           exit 0
 
   cac-apply:
@@ -1257,6 +1261,7 @@ jobs:
         id: stack
         env:
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # CAC-19: this job must not be able to decrypt deploy/secrets. With
           # the age key, `sl cac` would register sops values (rotate) from CI.
@@ -1269,7 +1274,7 @@ jobs:
             echo "No cac/stack.ts in this repo: CaC apply skipped."
           elif [ -z "${IDACHU_CAC_KEY}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${{ inputs.deploy-env }}' environment: CaC apply skipped."
+            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC apply skipped."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -1345,6 +1350,7 @@ jobs:
           FISTO_URL: ${{ vars.FISTO_URL }}
           IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # Exit 2 here means the apply worked but left orphans: resources the
           # stack no longer declares. It is a finding, not a failure, and this
@@ -1352,11 +1358,11 @@ jobs:
           # are already out would say "the release broke" about something that
           # did not. It annotates instead; the orphans get cleaned in a PR.
           set +e
-          yarn sl cac apply --env "${{ inputs.deploy-env }}" --no-create-keys
+          yarn sl cac apply --env "${DEPLOY_ENV}" --no-create-keys
           code=$?
           set -e
           if [ "${code}" -eq 2 ]; then
-            echo "::warning::CaC apply for '${{ inputs.deploy-env }}' left orphans. Read the list above and clean them in a PR."
+            echo "::warning::CaC apply for '${DEPLOY_ENV}' left orphans. Read the list above and clean them in a PR."
             exit 0
           fi
           exit "${code}"
