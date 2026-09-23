@@ -30,8 +30,8 @@ flowchart TD
 | `static-checks` | pull requests and pushes | `yarn ci` once, repo-wide: typecheck, lint, test, build. |
 | `security` | every event but `repository_dispatch` | Calls [`security.yml@main`](./security.md) with the images from `matrix`. Grype only runs on push and schedule. |
 | `version` | push to `main`, not on the bumper's own `chore(release): v…` commit | The **fork point**. Computes the next version from conventional commits, bumps every `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z [skip ci]`, tags, pushes atomically, creates the GitHub release. |
-| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z`, `<sha>` and `latest`, where `<sha>` (and the `BUILD_COMMIT` build-arg) is the commit the tag points at. |
-| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable` (a failed retag only warns). If `sl deploy` itself fails or is cancelled, it rolls back — see [Rollback](#rollback). |
+| `build-images` | when `version` bumped | One image per service from the tag, pushed to GHCR as `vX.Y.Z` and `<sha>`, where `<sha>` (and the `BUILD_COMMIT` build-arg) is the commit the tag points at. `latest` moves only after a successful deploy, with `<env>-stable` (with `deploy: false`, here). |
+| `deploy` | when `version` bumped and `deploy` is `true` | `yarn sl deploy <env> --tag vX.Y.Z` in the `<env>` GitHub Environment: migrations, services in descriptor order, workers, smoke checks, edge and monitoring registration. Then tags every image `<env>-stable` and `latest` (a failed retag only warns). If `sl deploy` itself fails or is cancelled, it rolls back — see [Rollback](#rollback). |
 | `cac-plan` | pull requests | `yarn cac plan --env <env>` when the repo has `cac/stack.ts`. |
 | `cac-apply` | after a successful (or skipped) deploy | `yarn cac apply --env <env> --no-create-keys` when the repo has `cac/stack.ts`. |
 | `secrets-rotate` | `repository_dispatch: skylabs-operators-changed` only | Re-encrypts `deploy/secrets/*.env` for the current operators (`yarn sl secrets rotate`) and commits `chore(secrets): recipients del registro [skip ci]`. |
@@ -121,7 +121,7 @@ Every image is built with two build arguments:
 | Build arg | Value |
 |---|---|
 | `APP_VERSION` | `vX.Y.Z`, the version `version` just tagged |
-| `BUILD_COMMIT` | the `main` commit being built |
+| `BUILD_COMMIT` | the commit being built: the one the release tag points at |
 
 A Dockerfile that wants them declares `ARG APP_VERSION` / `ARG BUILD_COMMIT` and fixes them as
 `ENV`. Runtime code reads the version in this order, never from `package.json` in production:

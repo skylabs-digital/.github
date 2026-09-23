@@ -603,8 +603,16 @@ jobs:
   # ============================================================
   # STAGE 3 — BUILD IMAGES
   # One matrix entry per service, sourced from the descriptor (job `matrix`).
-  # Pushes vN + sha + latest to GHCR. Unreachable on PR (needs version, which
-  # never runs there).
+  # Pushes vN + sha to GHCR. Unreachable on PR (needs version, which never
+  # runs there).
+  #
+  # `:latest` is NOT pushed here when this pipeline deploys (DEP-17(1)): it
+  # used to point at the newest BUILD before anyone knew whether its deploy
+  # worked, and every `${X_TAG:-latest}` in a compose file (a fresh droplet,
+  # a lost `<SVC>_TAG`) then started an image nobody had validated. It moves
+  # together with `<env>-stable`, after a successful deploy. With
+  # `deploy: false` there is no deploy to wait for, so it is pushed here as
+  # before.
   # ============================================================
   build-images:
     name: Build image (${{ matrix.service.name }})
@@ -642,7 +650,7 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:v${{ needs.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:${{ steps.commit.outputs.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service.name }}:latest
+            ${{ !inputs.deploy && format('ghcr.io/{0}/{1}:latest', github.repository_owner, matrix.service.name) || '' }}
           build-args: |
             BUILD_COMMIT=${{ steps.commit.outputs.sha }}
             APP_VERSION=v${{ needs.version.outputs.version }}
@@ -799,23 +807,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag as ${{ inputs.deploy-env }}-stable
+      - name: Tag as ${{ inputs.deploy-env }}-stable and latest
         # Sigue siendo un paso del workflow y no de `sl`: es una operación sobre
         # el REGISTRO de imágenes, no sobre un droplet, y el CLI no hace
         # operaciones de registro en esta etapa (regla de entrada del estándar).
+        # `latest` se mueve acá y no en build-images: es lo último que un
+        # deploy VALIDÓ, no lo último que se construyó (DEP-17(1)).
         if: success()
         continue-on-error: true
         env:
           SERVICES: ${{ needs.matrix.outputs.services }}
           TAG: v${{ needs.version.outputs.version }}
           DEPLOY_ENV: ${{ inputs.deploy-env }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           for NAME in $(echo "$SERVICES" | jq -r '.[].name'); do
-            IMAGE="ghcr.io/${{ github.repository_owner }}/${NAME}"
+            IMAGE="ghcr.io/${OWNER}/${NAME}"
             docker pull "${IMAGE}:${TAG}"
-            docker tag "${IMAGE}:${TAG}" "${IMAGE}:${DEPLOY_ENV}-stable"
-            docker push "${IMAGE}:${DEPLOY_ENV}-stable"
+            for CHANNEL in "${DEPLOY_ENV}-stable" latest; do
+              docker tag "${IMAGE}:${TAG}" "${IMAGE}:${CHANNEL}"
+              docker push "${IMAGE}:${CHANNEL}"
+            done
           done
 
       # Qué: redeploy del último release bueno desde SU checkout (fragmento,

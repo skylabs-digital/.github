@@ -197,6 +197,18 @@ def check_stable_retag_cannot_fail_a_deploy(wfs: dict[str, dict]) -> list[str]:
     return errors
 
 
+def check_latest_is_validated(wfs: dict[str, dict]) -> list[str]:
+    """`:latest` is what a deploy validated, not the newest build: the build
+    only pushes it when the pipeline does not deploy (DEP-17(1))."""
+    job = jobs(wfs["app-release.yml"])["build-images"]
+    for s in steps(job):
+        tags = str((s.get("with") or {}).get("tags", ""))
+        for line in tags.splitlines():
+            if ":latest" in line and "!inputs.deploy" not in line:
+                return [f"app-release.yml:build-images pushes :latest unconditionally: {line.strip()}"]
+    return []
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -206,6 +218,7 @@ CHECKS = [
     check_deploy_manual_deploys_the_tag,
     check_rollback_only_when_the_deploy_failed,
     check_stable_retag_cannot_fail_a_deploy,
+    check_latest_is_validated,
 ]
 
 
