@@ -216,6 +216,8 @@ jobs:
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: docs
+          # A repository_dispatch needs contents:write on the target; nothing else.
+          permission-contents: write
 
       - if: steps.app-token.outputs.token != ''
         name: Ask docs to rebuild now

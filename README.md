@@ -30,8 +30,9 @@ SHA-pinned here, so every caller inherits the hardening.
 Two traps worth knowing before you touch a reusable:
 
 - **A reusable job that requests a permission its caller did not grant makes the whole run fail
-  at startup**, on every event. Reusables declare no `permissions:` of their own and only ever
-  reduce at job level.
+  at startup**, on every event. Reusables declare no workflow-level `permissions:` and only ever
+  reduce at job level: every job names the subset it needs (`contents: read` for anything that
+  runs pull-request code), and `scripts/tests/check_workflows.py` keeps it that way.
 - **An app caller must declare `repository_dispatch: skylabs-operators-changed`** and split its
   `concurrency.group` for that event, or it never re-encrypts its secrets when an operator
   leaves — and nothing warns you.

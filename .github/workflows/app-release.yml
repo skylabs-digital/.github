@@ -202,6 +202,9 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'repository_dispatch'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (`yarn install`): read-only, whatever the caller granted (DEP-15).
+    permissions:
+      contents: read
     # Todos los jobs de este archivo corren en la pool self-hosted, que son
     # NUEVE runners para toda la flota: uno colgado no se recicla solo como una
     # VM de GitHub, se queda con su lugar hasta que alguien lo mate a mano. Las
@@ -214,6 +217,8 @@ jobs:
       services: ${{ steps.sl.outputs.services }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
@@ -261,9 +266,14 @@ jobs:
     if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
     name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (`yarn ci`): read-only, whatever the caller granted (DEP-15).
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       - run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
@@ -330,6 +340,9 @@ jobs:
       github.ref == 'refs/heads/main' &&
       !startsWith(github.event.head_commit.message, 'chore(release): v')
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Commits, tags and releases with the App token, not GITHUB_TOKEN.
+    permissions:
+      contents: read
     timeout-minutes: 10
     outputs:
       version: ${{ steps.bump.outputs.version }}
@@ -341,6 +354,7 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: write
           # SIN `owner:` a propósito. Con `owner` el token sale con acceso a
           # TODOS los repos donde la App está instalada (los 41); sin él, la
           # action lo acota al repo actual, que es lo único que este job toca:
@@ -627,6 +641,10 @@ jobs:
     needs: [version, matrix]
     if: needs.version.outputs.bumped == 'true'
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Pushes the images to GHCR with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -682,6 +700,10 @@ jobs:
     needs: [version, build-images, matrix]
     if: needs.version.outputs.bumped == 'true' && inputs.deploy
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Retags `<env>-stable`/`latest` in GHCR with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
     timeout-minutes: 30
     environment: ${{ inputs.deploy-env }}
     # One deploy at a time per (app, env), shared with deploy-manual.yml
@@ -711,15 +733,19 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -1032,10 +1058,15 @@ jobs:
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     needs: static-checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code (the branch's cac/stack.ts): read-only (DEP-15).
+    permissions:
+      contents: read
     timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       # Decide ACÁ si el job hace algo, antes de instalar nada y antes de pedirle
       # el registro a otro repo. Con el chequeo de la key metido más abajo, un
       # repo sin key igual hacía `yarn install` y el checkout de infra, y moría
@@ -1104,16 +1135,20 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -1183,6 +1218,9 @@ jobs:
     # Bead sl-24x5.
     if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Talks to the providers with IDACHU_CAC_KEY; GITHUB_TOKEN only reads.
+    permissions:
+      contents: read
     timeout-minutes: 10
     environment: ${{ inputs.deploy-env }}
     steps:
@@ -1251,16 +1289,20 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
-          # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
-          # Token efímero (1h) y de un repo, en lugar del PAT `repo` que podía
-          # ESCRIBIR en los 41 repos privados de la org.
+          # SÓLO `infra` y SÓLO lectura: el repo propio ya se checkouteó con el
+          # GITHUB_TOKEN. Sin `permission-contents: read` el token salía con
+          # todos los permisos de la App — escritura en infra, cuyos rulesets
+          # la App saltea —, y en `cac-plan` eso corre con el código del PR
+          # (SEC-02). El checkout no lo deja en .git/config.
           repositories: infra
 
       - name: Checkout del registro (sparse)
         if: steps.stack.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
@@ -1369,11 +1411,23 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: write
           owner: ${{ github.repository_owner }}
-          # Acotado a lo que este job checkoutea y nada más: su propio repo, y
-          # `infra` para el registro de la plataforma (sparse, sólo registry/).
-          # Sin esta línea el token sale con acceso a los 41 repos de la org.
-          repositories: ${{ github.event.repository.name }},infra
+          # SÓLO el repo propio, con contents:write: commitea y pushea los
+          # recipients a su rama protegida. Antes era `<repo>,infra` con TODOS
+          # los permisos de la App — escritura en infra, cuyos rulesets la App
+          # saltea (SEC-02). El registro va con su propio token, abajo.
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Token para leer el registro
+        id: registry-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3.1.1
+        with:
+          client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
+          owner: ${{ github.repository_owner }}
+          repositories: infra
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -1398,17 +1452,17 @@ jobs:
 
       # Sólo el registro: un checkout sparse de infra, no el repo entero.
       # Mismo `path: .infra-registry` que el job `deploy`, para que el nombre no
-      # dependa del job. Desde 2026-09-16 TODOS los checkouts del registro usan
-      # un token de la App; éste está acotado a `<repo>,infra` y no sólo a
-      # `infra` porque el mismo token pushea a la rama protegida de la app.
+      # dependa del job. Como en todos los checkouts del registro, con un token
+      # de la App de SÓLO lectura sobre infra, y sin dejarlo en .git/config.
       - name: Checkout del registro de la plataforma
         if: steps.secretos.outputs.present == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: ${{ github.repository_owner }}/infra
           ref: main
           path: .infra-registry
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.registry-token.outputs.token }}
           sparse-checkout: registry
           sparse-checkout-cone-mode: true
 

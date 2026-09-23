@@ -106,6 +106,9 @@ jobs:
     if: github.actor != 'dependabot[bot]'
     name: Tests under a foreign timezone (${{ inputs.time-zone }})
     runs-on: ${{ fromJson(inputs.runner-labels) }}
+    # Runs PR code: read-only.
+    permissions:
+      contents: read
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
       # Job-level, i.e. the PROCESS environment of every step — the mechanism

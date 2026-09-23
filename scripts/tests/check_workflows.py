@@ -227,6 +227,86 @@ def check_one_deploy_at_a_time_per_app_and_env(wfs: dict[str, dict]) -> list[str
     return errors
 
 
+# Jobs that may inherit the caller's permissions, and why.
+INHERITS_ON_PURPOSE = {
+    # A `uses:` job capped here would cap security.yml's weekly issue upsert,
+    # which needs the caller's `issues: write` (not every caller grants it).
+    ("app-release.yml", "security"),
+    ("lib-release.yml", "security"),
+    ("docs.yml", "docs"),
+    # Needs `issues: write` from the callers that grant it; declaring it would
+    # fail at startup in the callers that do not.
+    ("security.yml", "weekly-security-report"),
+}
+# App tokens that keep the App's full permission set, and why.
+APP_TOKEN_FULL_ON_PURPOSE = {
+    # semantic-release's GitHub plugin comments on the released issues/PRs
+    # with this token; narrowing it could fail a release. Scoped to the repo.
+    ("lib-release.yml", "release"),
+    # Callers do not pass app-id today (app-release forwards only npm-token).
+    ("security.yml", "docker-scan"),
+}
+
+
+def check_every_job_declares_permissions(wfs: dict[str, dict]) -> list[str]:
+    """Least privilege per job (DEP-15(1)): a job that runs PR code gets
+    `contents: read`, not the caller's `contents: write, packages: write,
+    id-token: write`. Only ever a SUBSET of what every caller grants: more
+    fails the whole run at startup."""
+    errors = []
+    for name, wf in wfs.items():
+        if name == "ci.yml":
+            continue  # this repo's own CI: workflow-level `contents: read`
+        for job_id, job in jobs(wf).items():
+            if (name, job_id) in INHERITS_ON_PURPOSE:
+                continue
+            if "permissions" not in job:
+                errors.append(f"{name}:{job_id}: no job-level permissions (inherits the caller's)")
+    return errors
+
+
+def check_app_tokens_are_narrow(wfs: dict[str, dict]) -> list[str]:
+    """Every GitHub App token names the permissions it needs (SEC-02): the
+    registry-reading one in a PR job was a contents:write token on infra,
+    whose App bypasses infra's rulesets."""
+    errors = []
+    for name, wf in wfs.items():
+        for job_id, job in jobs(wf).items():
+            for s in steps(job):
+                if not str(s.get("uses", "")).startswith("actions/create-github-app-token@"):
+                    continue
+                if (name, job_id) in APP_TOKEN_FULL_ON_PURPOSE:
+                    continue
+                w = s.get("with") or {}
+                perms = {k: v for k, v in w.items() if k.startswith("permission-")}
+                if not perms:
+                    errors.append(f"{name}:{job_id}:{s.get('name')}: App token with every permission of the App")
+                if w.get("repositories") == "infra" and perms != {"permission-contents": "read"}:
+                    errors.append(f"{name}:{job_id}:{s.get('name')}: the registry token must be contents:read only, got {perms}")
+    return errors
+
+
+def check_untrusted_checkouts_keep_no_token(wfs: dict[str, dict]) -> list[str]:
+    """`persist-credentials: false` on the registry checkouts and on the app
+    checkouts of jobs that run PR code (SEC-02(2), DEP-15(2)): otherwise the
+    token sits in .git/config for any script that runs next."""
+    pr_jobs = {("app-release.yml", j) for j in ("matrix", "static-checks", "cac-plan")}
+    pr_jobs |= {("lib-release.yml", j) for j in ("ci", "mutation")}
+    pr_jobs |= {("security.yml", j) for j in ("osv-scan", "secrets-scan", "docker-scan")}
+    errors = []
+    for name, wf in wfs.items():
+        for job_id, job in jobs(wf).items():
+            for s in steps(job):
+                if not str(s.get("uses", "")).startswith("actions/checkout@"):
+                    continue
+                w = s.get("with") or {}
+                registry = "infra" in str(w.get("repository", ""))
+                if (registry or (name, job_id) in pr_jobs) and w.get("persist-credentials") is not False:
+                    what = "registry" if registry else "app"
+                    errors.append(f"{name}:{job_id}: the {what} checkout persists its token")
+    return errors
+
+
 CHECKS = [
     check_parses,
     check_actions_pinned_by_sha,
@@ -238,6 +318,9 @@ CHECKS = [
     check_stable_retag_cannot_fail_a_deploy,
     check_latest_is_validated,
     check_one_deploy_at_a_time_per_app_and_env,
+    check_every_job_declares_permissions,
+    check_app_tokens_are_narrow,
+    check_untrusted_checkouts_keep_no_token,
 ]
 
 

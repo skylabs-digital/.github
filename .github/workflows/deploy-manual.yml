@@ -276,6 +276,7 @@ jobs:
         with:
           client-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          permission-contents: read
           owner: ${{ github.repository_owner }}
           # SÓLO `infra`: el repo propio ya se checkouteó con el GITHUB_TOKEN.
           repositories: infra
@@ -283,6 +284,7 @@ jobs:
       - name: Checkout del registro (sparse)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
           repository: skylabs-digital/infra
           path: .infra-registry
           sparse-checkout: registry
