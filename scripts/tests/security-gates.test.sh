@@ -11,6 +11,7 @@ WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/security-test.XXXXXX")"
 trap 'rm -rf "${WORK_ROOT}"' EXIT
 extract_step security.yml osv-scan gate > "${WORK_ROOT}/osv.sh"
 extract_step security.yml docker-scan "Gate on fixable findings" > "${WORK_ROOT}/grype.sh"
+extract_step security.yml secrets-scan "Scan repository (full history)" > "${WORK_ROOT}/gitleaks.sh"
 
 # gate <script> <event> [results file content] — exit code; env passes through.
 gate() {
@@ -35,5 +36,27 @@ CURRENT_TEST="DEP-18: Grype that could not scan is red on push, a warning on sch
 GRYPE_RC=1 gate "${WORK_ROOT}/grype.sh" push '' && fail "push: green without a scan" || pass "push: red"
 GRYPE_RC=1 gate "${WORK_ROOT}/grype.sh" schedule '' && pass "schedule: warning only" || fail "$(cat "${WORK_ROOT}/log")"
 GRYPE_RC=0 gate "${WORK_ROOT}/grype.sh" push '{"matches":[]}' && pass "push: a clean scan stays green" || fail "$(cat "${WORK_ROOT}/log")"
+
+CURRENT_TEST="SEC-21: a .gitleaks.toml must extend the default rules"
+mkdir -p "${WORK_ROOT}/bin"
+printf '#!/bin/sh\necho "gitleaks $*" >> "%s/gitleaks.log"\n' "${WORK_ROOT}" > "${WORK_ROOT}/bin/gitleaks"
+chmod +x "${WORK_ROOT}/bin/gitleaks"
+leaks() {  # leaks <config content or "none"> — exit code
+  local dir="${WORK_ROOT}/repo"; rm -rf "$dir"; mkdir -p "$dir"
+  if [ "$1" != "none" ]; then printf '%s\n' "$1" > "$dir/.gitleaks.toml"; fi
+  set +e
+  (cd "$dir" && PATH="${WORK_ROOT}/bin:${PATH}" run_step "${WORK_ROOT}/gitleaks.sh") > "${WORK_ROOT}/log" 2>&1
+  local rc=$?
+  set -e
+  return "$rc"
+}
+leaks '[allowlist]
+paths = ["docs/"]' && fail "allowlist-only config accepted (zero rules)" || pass "allowlist-only config refused"
+leaks '[extend]
+useDefault = true
+
+[allowlist]
+paths = ["docs/"]' && pass "extending config accepted" || fail "$(cat "${WORK_ROOT}/log")"
+leaks none && pass "no config: defaults" || fail "$(cat "${WORK_ROOT}/log")"
 
 finish

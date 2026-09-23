@@ -242,7 +242,15 @@ jobs:
           set -euo pipefail
           CONFIG_FLAG=""
           if [ -f .gitleaks.toml ]; then
-            echo "Using .gitleaks.toml allowlist from calling repo"
+            # A config WITHOUT `[extend] useDefault = true` replaces the
+            # default rules instead of extending them: an allowlist-only file
+            # means zero rules, and a check that is green forever (resuelto:
+            # 0 findings with its config, 42 with the defaults — SEC-21).
+            if ! grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' .gitleaks.toml; then
+              echo "::error title=Gitleaks config::.gitleaks.toml does not extend the default rules. Add:%0A[extend]%0AuseDefault = true%0Aat the top, or this scan checks nothing (SEC-21)."
+              exit 1
+            fi
+            echo "Using .gitleaks.toml (extends the default rules) from calling repo"
             CONFIG_FLAG="-c .gitleaks.toml"
           fi
           gitleaks detect --source . $CONFIG_FLAG --redact --exit-code 1 --verbose

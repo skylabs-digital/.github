@@ -41,7 +41,16 @@ non-zero fail the job; in report mode they are a warning (DEP-18).
 
 **Gitleaks always blocks**, whatever the mode: a leaked secret stays leaked. Suppress confirmed
 false positives in the calling repo with a `.gitleaks.toml` allowlist (passed with `-c`) or
-fingerprints in `.gitleaksignore`. Grype honours a `.grype.yaml` in the calling repo.
+fingerprints in `.gitleaksignore`. The `.gitleaks.toml` **must start with**
+
+```toml
+[extend]
+useDefault = true
+```
+
+or it replaces the default rules instead of extending them — an allowlist-only file means zero
+rules and a check that is green forever. The job fails on such a file (SEC-21). Grype honours a
+`.grype.yaml` in the calling repo.
 
 Gitleaks and Grype are downloaded from their GitHub releases with a pinned SHA-256 into the job's
 `$RUNNER_TEMP`: no `curl | sh`, no `sudo`, nothing left in `/usr/local/bin` of a shared runner.
