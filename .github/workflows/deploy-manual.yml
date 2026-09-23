@@ -253,9 +253,10 @@ jobs:
     permissions:
       contents: read
     # Un `sl deploy` colgado contra un droplet retendría un runner self-hosted
-    # hasta que alguien lo mate a mano. Un deploy real son minutos; 30 cubre el
-    # completo (migraciones + servicios + borde + monitoreo) con aire.
-    timeout-minutes: 30
+    # hasta que alguien lo mate a mano. Un deploy real son minutos; 45 cubre el
+    # completo (migraciones + servicios + borde + monitoreo) y, si falla, el
+    # redeploy del último release bueno que hace el rollback (DEP-04).
+    timeout-minutes: 45
     # Un deploy a la vez por (app, entorno), COMPARTIDO con el job `deploy` de
     # app-release.yml, y NUNCA se cancela a mitad: cancelar entre el `up` y el
     # promote deja el droplet en un estado que nadie pidió. Antes el grupo era

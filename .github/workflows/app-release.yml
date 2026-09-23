@@ -712,7 +712,10 @@ jobs:
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 30
+    # 45 and not 30: a failed deploy (up to ~15 min measured) can now be
+    # followed by a full redeploy of the last-good release (DEP-04), and a
+    # timeout in the middle of that rollback is the worst place to stop.
+    timeout-minutes: 45
     environment: ${{ inputs.deploy-env }}
     # One deploy at a time per (app, env), shared with deploy-manual.yml
     # (DEP-14(3)). The droplet-side `flock` lasts ONE command, not the whole
