@@ -62,7 +62,7 @@ protocol just requires one. `--no-create-keys` because the stack has no keys, an
 
 | Input | Type | Default | Meaning |
 |---|---|---|---|
-| `cli-version` | string | `1.21.0` | The `sl` this job runs. Needs 1.21.0 or later: `auth: github`, `--no-create-keys` without a secrets destination, the version header |
+| `cli-version` | string | `1.37.0` | The `sl` this job runs. Needs 1.21.0 or later: `auth: github`, `--no-create-keys` without a secrets destination, the version header. From 1.36.0 the `sl cac apply` step also requires a clean checkout of `main` (no tracked file modified by `yarn install`) |
 | `stack-file` | string | `cac/docs.ts` | The stack that announces the section |
 | `ref` | string | `main` | What to check out |
 | `node-version` | string | `24` | Node for the job |
