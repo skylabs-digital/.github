@@ -166,9 +166,16 @@ on:
         required: false
       IDACHU_CAC_KEY:
         description: >-
-          CaC (skylabs/docs/standards/skylabs-cac.md §7-8): idachu PLATFORM key with
-          idachu:cac + noten:cac, scoped per GitHub Environment (qa/prod). Only read
-          when the repo has cac/stack.ts; absent → the CaC jobs skip with a warning.
+          CaC against QA (skylabs/docs/standards/skylabs-cac.md §7-8): idachu PLATFORM
+          key with idachu:cac + noten:cac. The org secret; it is NEVER sent to prod.
+          Only read when the repo has cac/stack.ts; absent → the CaC jobs skip with a warning.
+        required: false
+      IDACHU_CAC_KEY_PROD:
+        description: >-
+          CaC against PROD: prod's idachu PLATFORM key, a secret of the calling repo's
+          `prod` GitHub Environment (never an org secret). `sl cac --env prod` in CI
+          takes only this name (cli#101): the org's IDACHU_CAC_KEY never satisfies prod.
+          Absent on a prod release → the CaC jobs skip with a warning.
         required: false
       SOPS_AGE_KEY:
         description: >-
@@ -1061,8 +1068,11 @@ jobs:
   # vars IDACHU_URL / NOTEN_URL / FISTO_URL (one <PREFIX>_URL per provider the
   # stack uses; the CLI derives the name from the provider's envPrefix) and
   # secret IDACHU_CAC_KEY (an idachu PLATFORM key with idachu:cac + noten:cac +
-  # fisto:cac). noten and fisto have no key of their own — the CLI exchanges
-  # IDACHU_CAC_KEY for a service token (service-identity.md §4).
+  # fisto:cac) for qa, and IDACHU_CAC_KEY_PROD (the `prod` Environment's secret)
+  # for prod: each job passes ONLY the one of its deploy-env, so QA's org key
+  # never reaches prod (`sl` refuses it there anyway, cli#101). noten and fisto
+  # have no key of their own — the CLI exchanges the platform key for a service
+  # token (service-identity.md §4).
   # Without the secret the job warns and exits 0, so a repo can adopt the
   # stack before the org has minted the key.
   #
@@ -1106,7 +1116,8 @@ jobs:
       - name: ¿Corre CaC en este repo?
         id: stack
         env:
-          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          IDACHU_CAC_KEY: ${{ inputs.deploy-env != 'prod' && secrets.IDACHU_CAC_KEY || '' }}
+          IDACHU_CAC_KEY_PROD: ${{ inputs.deploy-env == 'prod' && secrets.IDACHU_CAC_KEY_PROD || '' }}
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # CAC-19: this job must not be able to decrypt deploy/secrets. With
@@ -1118,9 +1129,10 @@ jobs:
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC plan skipped."
-          elif [ -z "${IDACHU_CAC_KEY}" ]; then
+          elif [ -z "${IDACHU_CAC_KEY}${IDACHU_CAC_KEY_PROD}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
+            key_name=IDACHU_CAC_KEY; [ "${DEPLOY_ENV}" = "prod" ] && key_name=IDACHU_CAC_KEY_PROD
+            echo "::warning::${key_name} is not set in the '${DEPLOY_ENV}' environment: CaC plan skipped. This repo's CaC is NOT being verified on any PR."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -1197,7 +1209,8 @@ jobs:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
           NOTEN_URL: ${{ vars.NOTEN_URL }}
           FISTO_URL: ${{ vars.FISTO_URL }}
-          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          IDACHU_CAC_KEY: ${{ inputs.deploy-env != 'prod' && secrets.IDACHU_CAC_KEY || '' }}
+          IDACHU_CAC_KEY_PROD: ${{ inputs.deploy-env == 'prod' && secrets.IDACHU_CAC_KEY_PROD || '' }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
@@ -1271,7 +1284,8 @@ jobs:
       - name: ¿Corre CaC en este repo?
         id: stack
         env:
-          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          IDACHU_CAC_KEY: ${{ inputs.deploy-env != 'prod' && secrets.IDACHU_CAC_KEY || '' }}
+          IDACHU_CAC_KEY_PROD: ${{ inputs.deploy-env == 'prod' && secrets.IDACHU_CAC_KEY_PROD || '' }}
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           # CAC-19: this job must not be able to decrypt deploy/secrets. With
@@ -1283,9 +1297,10 @@ jobs:
           if [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC apply skipped."
-          elif [ -z "${IDACHU_CAC_KEY}" ]; then
+          elif [ -z "${IDACHU_CAC_KEY}${IDACHU_CAC_KEY_PROD}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::IDACHU_CAC_KEY is not set in the '${DEPLOY_ENV}' environment: CaC apply skipped."
+            key_name=IDACHU_CAC_KEY; [ "${DEPLOY_ENV}" = "prod" ] && key_name=IDACHU_CAC_KEY_PROD
+            echo "::warning::${key_name} is not set in the '${DEPLOY_ENV}' environment: CaC apply skipped."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -1359,7 +1374,8 @@ jobs:
           IDACHU_URL: ${{ vars.IDACHU_URL }}
           NOTEN_URL: ${{ vars.NOTEN_URL }}
           FISTO_URL: ${{ vars.FISTO_URL }}
-          IDACHU_CAC_KEY: ${{ secrets.IDACHU_CAC_KEY }}
+          IDACHU_CAC_KEY: ${{ inputs.deploy-env != 'prod' && secrets.IDACHU_CAC_KEY || '' }}
+          IDACHU_CAC_KEY_PROD: ${{ inputs.deploy-env == 'prod' && secrets.IDACHU_CAC_KEY_PROD || '' }}
           SL_REGISTRY: ${{ github.workspace }}/.infra-registry/registry/apps.json
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
