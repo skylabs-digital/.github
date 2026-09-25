@@ -890,7 +890,7 @@ jobs:
           last=""
           if out="$(SL_FORMAT=json yarn sl deploy "${DEPLOY_ENV}" status --json 2>/dev/null | tail -n 1)"; then
             last="$(printf '%s' "$out" | jq -r --arg svc "${SERVICE}" '
-              [(.data.servicios // [])[] | select($svc == "" or .service == $svc) | .lastGood // empty]
+              [(.data.services // .data.servicios // [])[] | select($svc == "" or .service == $svc) | .lastGood // empty]
               | unique | if length == 1 then .[0] else "" end' 2>/dev/null || true)"
           fi
           if [[ "${last}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "${last}" != "${TAG}" ]; then
