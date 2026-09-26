@@ -145,7 +145,8 @@ on:
 # este repo correría en el contexto de `.github`, cuyo GITHUB_TOKEN no alcanza
 # los paquetes de los otros repos — que es exactamente por qué la versión
 # centralizada nunca funcionó. El disparador vive en el repo dueño de las
-# imágenes: app-release.yml llama a este reusable tras un release verde.
+# imágenes: app-release.yml llama a este reusable en el `schedule` semanal de
+# cada app (no tras cada release).
 
 permissions:
   contents: read

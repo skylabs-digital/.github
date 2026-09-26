@@ -1430,13 +1430,14 @@ jobs:
   # falta. La versión centralizada nunca funcionó — ver la cabecera de
   # ghcr-retention.yml.
   #
-  # Va después del deploy y no antes: recién ahí existe la imagen nueva y la
-  # vieja pasa a ser podable. Y con las mismas condiciones que `cac-apply`, que
-  # es el otro job que sólo tiene sentido tras un release verde.
+  # Runs on the caller's `schedule` event only (every app caller has the
+  # weekly `0 6 * * 1` cron), not after every release: retention is by age and
+  # environment tag, so once a week is enough, and each release no longer
+  # starts an extra job. It needs only `matrix`, for the package names.
   ghcr-retention:
     name: Poda de imágenes viejas (GHCR)
-    needs: [version, matrix, deploy]
-    if: "!cancelled() && needs.version.outputs.bumped == 'true' && (needs.deploy.result == 'success' || inputs.deploy == false)"
+    needs: [matrix]
+    if: "!cancelled() && github.event_name == 'schedule' && needs.matrix.result == 'success'"
     uses: skylabs-digital/.github/.github/workflows/ghcr-retention.yml@main
     permissions:
       contents: read
