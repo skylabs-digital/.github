@@ -204,17 +204,19 @@ jobs:
   # descriptor y nada más: build, scan y deploy lo ven solos.
   # ============================================================
   matrix:
-    # Igual que `static-checks`: Dependabot no recibe secrets en sus propios
-    # `pull_request`, y este job autentica `yarn install` con GHCR_TOKEN. A
-    # diferencia de `static-checks`, SÍ corre en `schedule` — el leg de Grype
+    # Runs on Dependabot PRs too. Those runs read secrets from the Dependabot
+    # store, not the Actions store, and `yarn install` only needs GHCR_TOKEN,
+    # which the org keeps in both (the same secret `.github/dependabot.yml`
+    # uses for `registries:`). A ruleset requires this context on every PR.
+    # A diferencia de `static-checks`, SÍ corre en `schedule` — el leg de Grype
     # en `security` necesita una lista real de servicios para el scan
-    # periódico, y en schedule el actor no es dependabot.
+    # periódico.
     # `repository_dispatch`: NO corre. Su único consumidor en ese evento sería
     # `security`, que queda salteado, y como no hay `needs:` con
     # `secrets-rotate`, un fallo suyo pintaría de rojo un run cuya rotación
     # salió bien. Es un `yarn install` + `sl app services` por app por rotación
     # que no consume nadie.
-    if: github.actor != 'dependabot[bot]' && github.event_name != 'repository_dispatch'
+    if: github.event_name != 'repository_dispatch'
     name: Servicios (del descriptor)
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     # Runs PR code (`yarn install`): read-only, whatever the caller granted (DEP-15).
@@ -278,7 +280,10 @@ jobs:
   static-checks:
     # `repository_dispatch`: una rotación de recipients (job `secrets-rotate`)
     # no toca una línea de código — `yarn ci` entero no aporta nada ahí.
-    if: github.actor != 'dependabot[bot]' && github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
+    # Dependabot PRs run it like any other PR (see `matrix` for the token):
+    # a skipped job satisfies a required check, so skipping it here would let
+    # a dependency update merge without `yarn ci` ever running against it.
+    if: github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
     name: Static checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     # Runs PR code (`yarn ci`): read-only, whatever the caller granted (DEP-15).
@@ -315,13 +320,10 @@ jobs:
     # rest of the reusables.
     name: Security (org reusable@v1)
     needs: [matrix]
-    # `matrix` is skipped on Dependabot PRs (see its `if:` above). Today's
-    # behavior is that `security` still runs OSV/Gitleaks on every event —
-    # only Grype (image-scan) is gated to push/schedule, inside the reusable.
-    # Replicate that here: run unless `matrix` actually failed/was cancelled,
-    # falling back to an empty docker-images list when it was skipped. Grype
-    # never sees that empty list anyway on a Dependabot PR, since
-    # security.yml gates it to push/schedule internally.
+    # `security` runs OSV/Gitleaks on every event — only Grype (image-scan)
+    # is gated to push/schedule, inside the reusable. Run unless `matrix`
+    # actually failed/was cancelled, falling back to an empty docker-images
+    # list when it was skipped.
     # `repository_dispatch`: una rotación de recipients (job `secrets-rotate`)
     # no trae código nuevo que escanear, y la matriz de Grype es lo más caro
     # del pipeline.
@@ -1096,7 +1098,13 @@ jobs:
   # ============================================================
   cac-plan:
     name: CaC plan (${{ inputs.deploy-env }})
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    # No actor condition here. GitHub renders `name:` only for a job that
+    # starts: a job skipped by its `if:` reports the raw template
+    # ("CaC plan (${{ inputs.deploy-env }})"), which never matches the
+    # required context "release / CaC plan (qa)" and leaves the PR blocked.
+    # Dependabot PRs therefore start the job, and the first step below turns
+    # it into a no-op for them.
+    if: github.event_name == 'pull_request'
     needs: static-checks
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     # Runs PR code (the branch's cac/stack.ts): read-only (DEP-15).
@@ -1119,6 +1127,7 @@ jobs:
           IDACHU_CAC_KEY: ${{ inputs.deploy-env != 'prod' && secrets.IDACHU_CAC_KEY || '' }}
           IDACHU_CAC_KEY_PROD: ${{ inputs.deploy-env == 'prod' && secrets.IDACHU_CAC_KEY_PROD || '' }}
           DEPLOY_ENV: ${{ inputs.deploy-env }}
+          ACTOR: ${{ github.actor }}
         run: |
           # CAC-19: this job must not be able to decrypt deploy/secrets. With
           # the age key, `sl cac` would register sops values (rotate) from CI.
@@ -1126,7 +1135,13 @@ jobs:
             echo "::error title=CaC::SOPS_AGE_KEY is set in a CaC job: CI would register (rotate) API keys. See the comment on the CaC stage in app-release.yml."
             exit 1
           fi
-          if [ ! -f cac/stack.ts ]; then
+          # Dependabot runs only see the Dependabot secret store, which holds
+          # no CaC key and no App credentials, and its changes are limited to
+          # manifests and the lockfile, never cac/stack.ts.
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Dependabot PR: CaC plan not run (no CaC credentials in the Dependabot secret store)."
+          elif [ ! -f cac/stack.ts ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No cac/stack.ts in this repo: CaC plan skipped."
           elif [ -z "${IDACHU_CAC_KEY}${IDACHU_CAC_KEY_PROD}" ]; then
