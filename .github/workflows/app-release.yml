@@ -14,6 +14,8 @@ name: App Release (reusable)
 #   STAGE 4  image-scan        FOLDED INTO security.yml@main (Grype, push/sched only)
 #   STAGE 5  deploy            (needs version + build, bumped==true — ONE job,
 #                               ONE `sl deploy` invocation)
+#   STAGE 5  manual-regression-publish (needs version, bumped==true — posts
+#                               the manual catalog of the tag to qa-desk)
 #   STAGE 6  secrets-rotate   (repository_dispatch `skylabs-operators-changed`
 #                               only — re-cifra deploy/secrets/*.env)
 #
@@ -176,6 +178,11 @@ on:
           `prod` GitHub Environment (never an org secret). `sl cac --env prod` in CI
           takes only this name (cli#101): the org's IDACHU_CAC_KEY never satisfies prod.
           Absent on a prod release → the CaC jobs skip with a warning.
+        required: false
+      QA_DESK_TOKEN:
+        description: >-
+          qa-desk service token (org secret) for `manual-regression publish`. Only read when the
+          repo has manual-regression.config.*; absent → the publish job skips with a warning.
         required: false
       SOPS_AGE_KEY:
         description: >-
@@ -1408,6 +1415,87 @@ jobs:
             exit 0
           fi
           exit "${code}"
+
+  # ============================================================
+  # STAGE 5 — MANUAL REGRESSION CATALOG → qa-desk
+  #
+  # A repo with a manual regression suite (manual-regression.config.*,
+  # skylabs/docs/standards/manual-regression.md §8) publishes the catalog of
+  # every tag to qa-desk (docs.skylabs.digital/qa), where QA opens runs over
+  # it. Opt-in by presence, like CaC: no config → nothing runs. It needs only
+  # `version`: the catalog belongs to the tag whether or not its deploy went
+  # through, and a failure here blocks nothing (no job needs this one).
+  # Idempotent on qa-desk's side: the same cases are stored once, and a version
+  # is never overwritten (`publish-conflict`).
+  #
+  # Needs @skylabs-digital/manual-regression >= 1.1.0 (the `publish` command);
+  # an older pin skips with a warning instead of failing the release.
+  # ============================================================
+  manual-regression-publish:
+    name: Manual regression catalog → qa-desk
+    needs: [version]
+    if: "!cancelled() && needs.version.outputs.bumped == 'true'"
+    runs-on: ${{ fromJson(inputs.runner-labels) }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: v${{ needs.version.outputs.version }}
+          persist-credentials: false
+      - name: Does this repo have a manual regression suite?
+        id: suite
+        env:
+          HAS_TOKEN: ${{ secrets.QA_DESK_TOKEN != '' }}
+        run: |
+          if ! ls manual-regression.config.* >/dev/null 2>&1; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No manual-regression.config.* in this repo: nothing to publish."
+          elif [ "$HAS_TOKEN" != "true" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=qa-desk::QA_DESK_TOKEN is not available to this repo: the manual catalog of this release was not published."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: corepack enable
+        if: steps.suite.outputs.present == 'true'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        if: steps.suite.outputs.present == 'true'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: yarn
+      - name: Install
+        if: steps.suite.outputs.present == 'true'
+        run: yarn install --immutable
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN || secrets.GHCR_TOKEN }}
+      - name: Can the pinned lib publish?
+        id: lib
+        if: steps.suite.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          pj="node_modules/@skylabs-digital/manual-regression/package.json"
+          if [ ! -f "$pj" ]; then
+            echo "::error title=manual-regression::the repo has manual-regression.config.* but @skylabs-digital/manual-regression is not installed."
+            exit 1
+          fi
+          have="$(node -p "require('./${pj}').version")"
+          lowest="$(printf '%s\n%s\n' "1.1.0" "$have" | sort -V | head -n1)"
+          if [ "$lowest" != "1.1.0" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=manual-regression::this repo pins @skylabs-digital/manual-regression ${have}; publishing needs >= 1.1.0. The catalog of this release was not published."
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish
+        if: steps.lib.outputs.ok == 'true'
+        env:
+          QA_DESK_TOKEN: ${{ secrets.QA_DESK_TOKEN }}
+          VERSION: v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          yarn manual-regression publish --version "$VERSION" --sha "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
   # STAGE 6 — SECRETS ROTATE — reacciona al alta/baja de un operador
