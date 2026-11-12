@@ -14,8 +14,9 @@ name: App Release (reusable)
 #   STAGE 4  image-scan        FOLDED INTO security.yml@main (Grype, push/sched only)
 #   STAGE 5  deploy            (needs version + build, bumped==true — ONE job,
 #                               ONE `sl deploy` invocation)
-#   STAGE 5  manual-regression-publish (needs version, bumped==true — posts
-#                               the manual catalog of the tag to qa-desk)
+#   STAGE 5  manual-regression-publish (needs version — posts the manual
+#                               catalog of the tag to qa-desk; without a tag,
+#                               only a suite qa-desk lacks, as main-<sha7>)
 #   STAGE 6  secrets-rotate   (repository_dispatch `skylabs-operators-changed`
 #                               only — re-cifra deploy/secrets/*.env)
 #
@@ -1428,13 +1429,20 @@ jobs:
   # Idempotent on qa-desk's side: the same cases are stored once, and a version
   # is never overwritten (`publish-conflict`).
   #
+  # A push to main that does NOT release (the suite edited in a `docs`/`chore`/
+  # `test` commit, which the bumper skips) publishes too, but only when qa-desk
+  # does not hold those cases yet: it lands as `main-<sha7>`, and the next tag
+  # with the same cases is attached to that same catalog (same contentHash).
+  # Without this, a suite change stayed invisible in qa-desk until the next
+  # feat/fix, which in a quiet repo is weeks.
+  #
   # Needs @skylabs-digital/manual-regression >= 1.1.0 (the `publish` command);
   # an older pin skips with a warning instead of failing the release.
   # ============================================================
   manual-regression-publish:
     name: Manual regression catalog → qa-desk
     needs: [version]
-    if: "!cancelled() && needs.version.outputs.bumped == 'true'"
+    if: "!cancelled() && needs.version.result == 'success'"
     runs-on: ${{ fromJson(inputs.runner-labels) }}
     permissions:
       contents: read
@@ -1442,7 +1450,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: v${{ needs.version.outputs.version }}
+          ref: ${{ needs.version.outputs.bumped == 'true' && format('v{0}', needs.version.outputs.version) || github.sha }}
           persist-credentials: false
       - name: Does this repo have a manual regression suite?
         id: suite
@@ -1492,10 +1500,30 @@ jobs:
         if: steps.lib.outputs.ok == 'true'
         env:
           QA_DESK_TOKEN: ${{ secrets.QA_DESK_TOKEN }}
-          VERSION: v${{ needs.version.outputs.version }}
+          QA_DESK_URL: ${{ vars.QA_DESK_URL || 'https://docs.skylabs.digital' }}
+          BUMPED: ${{ needs.version.outputs.bumped }}
+          TAG: v${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          yarn manual-regression publish --version "$VERSION" --sha "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          SHA="$(git rev-parse HEAD)"
+          if [ "$BUMPED" = "true" ]; then
+            VERSION="$TAG"
+          else
+            # No release: publish only if qa-desk lacks these exact cases.
+            out="${RUNNER_TEMP}/manual-catalog.json"
+            yarn manual-regression build --out "$out" >/dev/null
+            repo="$(node -p "require('${out}').repo")"
+            hash="$(node -p "require('${out}').contentHash")"
+            have="$(curl -fsS -H "authorization: Bearer ${QA_DESK_TOKEN}" \
+              "${QA_DESK_URL%/}/api/qa/repos/${repo}/catalogs" \
+              | node -e 'let b="";process.stdin.on("data",d=>b+=d).on("end",()=>{const h=process.argv[1];console.log((JSON.parse(b).data??[]).some(c=>c.contentHash===h))})' "$hash")"
+            if [ "$have" = "true" ]; then
+              echo "qa-desk already has ${repo} ${hash}: the suite did not change, nothing to publish." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            VERSION="main-${SHA:0:7}"
+          fi
+          yarn manual-regression publish --version "$VERSION" --sha "$SHA" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
   # STAGE 6 — SECRETS ROTATE — reacciona al alta/baja de un operador
