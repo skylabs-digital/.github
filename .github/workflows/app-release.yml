@@ -1436,6 +1436,10 @@ jobs:
   # Without this, a suite change stayed invisible in qa-desk until the next
   # feat/fix, which in a quiet repo is weeks.
   #
+  # It also sends where the repo runs (the hosts of each environment from
+  # `routes` of deploy/skylabs.yaml), so qa-desk opens a run on the right host
+  # and asks each host's smoke for its version instead of making QA type them.
+  #
   # Needs @skylabs-digital/manual-regression >= 1.1.0 (the `publish` command);
   # an older pin skips with a warning instead of failing the release.
   # ============================================================
@@ -1524,6 +1528,60 @@ jobs:
             VERSION="main-${SHA:0:7}"
           fi
           yarn manual-regression publish --version "$VERSION" --sha "$SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Where the repo runs, so a QA run needs no typed URL: the hosts of each
+      # environment from `routes` of deploy/skylabs.yaml (qa → qa, prod →
+      # prod-readonly), `web` when the host's `/` is a `kind: web` service.
+      # The YAML parser is the one @skylabs-digital/cli (`yarn sl`) ships with.
+      # Advisory: a failure warns and never reddens the release.
+      - name: Publish environments
+        if: steps.suite.outputs.present == 'true' && hashFiles('deploy/skylabs.yaml') != ''
+        env:
+          QA_DESK_TOKEN: ${{ secrets.QA_DESK_TOKEN }}
+          QA_DESK_URL: ${{ vars.QA_DESK_URL || 'https://docs.skylabs.digital' }}
+        run: |
+          set -uo pipefail
+          body="${RUNNER_TEMP}/qa-desk-environments.json"
+          if ! node - > "$body" <<'JS'
+            const fs = require('node:fs');
+            const { createRequire } = require('node:module');
+            const cli = require.resolve('@skylabs-digital/cli/package.json', { paths: [process.cwd()] });
+            const YAML = createRequire(cli)('yaml');
+            const d = YAML.parse(fs.readFileSync(process.argv[2] || 'deploy/skylabs.yaml', 'utf8')) ?? {};
+            const kinds = Object.fromEntries(Object.entries(d.services ?? {}).map(([n, s]) => [n, s?.kind]));
+            const MAP = { qa: 'qa', prod: 'prod-readonly' };
+            const environments = {};
+            for (const [env, routes] of Object.entries(d.routes ?? {})) {
+              const to = MAP[env];
+              if (!to || !Array.isArray(routes)) continue;
+              environments[to] = routes
+                .filter((r) => r && typeof r.host === 'string')
+                .map((r) => {
+                  const root = r.paths?.['/'];
+                  const svc = typeof root === 'string' ? root : root?.service;
+                  return {
+                    url: `https://${r.host}`,
+                    smoke: typeof r.smoke === 'string' ? r.smoke : null,
+                    web: typeof svc === 'string' && kinds[svc] === 'web',
+                  };
+                });
+            }
+            process.stdout.write(JSON.stringify({ environments }));
+          JS
+          then
+            echo "::warning title=qa-desk::could not read routes from deploy/skylabs.yaml: environments not published."
+            exit 0
+          fi
+          # The repo name qa-desk files the catalog under is the catalog's own.
+          yarn manual-regression build --out "${RUNNER_TEMP}/qa-desk-catalog.json" >/dev/null
+          repo="$(node -p "require('${RUNNER_TEMP}/qa-desk-catalog.json').repo")"
+          code="$(curl -sS -o "${RUNNER_TEMP}/qa-desk-env-res.json" -w '%{http_code}' -X PUT \
+            -H "authorization: Bearer ${QA_DESK_TOKEN}" -H 'content-type: application/json' \
+            --data-binary @"$body" "${QA_DESK_URL%/}/api/qa/repos/${repo}/environments")"
+          if [ "$code" = "200" ]; then
+            echo "published the environments of ${repo}: $(node -p "Object.keys(require('${body}').environments).join(', ')")" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=qa-desk::PUT environments answered ${code}: $(head -c 300 "${RUNNER_TEMP}/qa-desk-env-res.json")"
+          fi
 
   # ============================================================
   # STAGE 6 — SECRETS ROTATE — reacciona al alta/baja de un operador
